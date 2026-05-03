@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+
+# Local config + state — never commit
+config_uk.json
+state_uk.json
+state.json
+*.log
+
+# OS
+.DS_Store
+
+# Local test artifacts
+test_state/
+smoke_test.py
