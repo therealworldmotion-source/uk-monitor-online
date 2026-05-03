@@ -89,6 +89,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler()],
 )
+# httpx logs every request at INFO — too noisy for our 30s long-poll cycle
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # ─── BROWSER CONSTANTS ────────────────────────────────────────────────────────
@@ -199,6 +201,9 @@ async def poll_telegram(offset: int, client: httpx.AsyncClient) -> list[dict]:
         resp = await client.get(url, params={"offset": offset, "timeout": 30}, timeout=35)
         if resp.status_code == 200:
             return resp.json().get("result", [])
+        # 401 (bad token), 404 (no bot found), etc — back off so we don't hot-loop
+        log.warning("Telegram poll returned %s — backing off 30s", resp.status_code)
+        await asyncio.sleep(30)
     except Exception as exc:
         log.error("Telegram poll error: %s", exc)
         await asyncio.sleep(5)
