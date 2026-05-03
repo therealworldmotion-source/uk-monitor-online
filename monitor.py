@@ -496,92 +496,48 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
 
 # ─── ARGOS ────────────────────────────────────────────────────────────────────
 
-async def _argos_next_data(page) -> dict | None:
-    """Argos is a Next.js app — server-rendered __NEXT_DATA__ JSON contains product + stock info
-    that's available even when the JS-driven finder-api is Akamai-blocked."""
-    try:
-        return await page.evaluate(
-            "JSON.parse(document.getElementById('__NEXT_DATA__')?.textContent || 'null')"
-        )
-    except Exception as exc:
-        log.warning("Argos: __NEXT_DATA__ extraction failed: %s", exc)
-        return None
-
-
-async def _argos_finder_in_page(page, pid: str, postcode: str) -> dict | None:
-    """Call Argos finder-api from inside a real browser context.
-    Direct curl gets a 403 from Akamai. From inside a real browser session, this sometimes works."""
-    pc = postcode.replace(" ", "")
-    urls = [
-        f"/finder-api/product;partNumber={pid}?postcode={pc}&includeIndelibleStores=true&skipStockCheck=false",
-        f"/finder-api/product?partNumber={pid}&postcode={pc}",
-    ]
-    for path in urls:
-        try:
-            data = await page.evaluate(f"""
-                fetch('{path}', {{
-                    headers: {{ 'Accept': 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' }},
-                    credentials: 'include'
-                }}).then(r => r.ok ? r.json() : null).catch(() => null)
-            """)
-            if data is not None:
-                return data
-            log.info("Argos %s: in-page fetch returned null for %s", pid, path)
-        except Exception as exc:
-            log.warning("Argos %s: in-page fetch failed for %s: %s", pid, path, exc)
-    return None
-
-
-def _argos_extract_from_next(payload: dict) -> tuple[str, dict, dict]:
-    """Best-effort parse of Next.js __NEXT_DATA__ payload from Argos product page."""
+def _argos_parse_html(html: str) -> tuple[str, dict]:
+    """Extract title, price, and online availability from the Argos product page HTML.
+    Online availability is signalled by the presence of an 'addToTrolley' control in the
+    server-rendered markup (Akamai blocks the finder-api, but the product page itself loads
+    cleanly through a UK residential proxy)."""
     title = ""
     online = {"available": False, "price": ""}
-    store: dict[str, Any] = {}
-    if not isinstance(payload, dict):
-        return title, online, store
 
-    # Walk the typical Next.js shape: props.pageProps.product / partner / availability
-    pp = (payload.get("props") or {}).get("pageProps") or {}
-    prod = pp.get("product") or pp.get("productData") or pp.get("Product") or {}
-    if isinstance(prod, dict):
-        title = prod.get("name") or prod.get("title") or ""
-        price = prod.get("price") or prod.get("priceVal") or (prod.get("attributes", {}) or {}).get("price")
-        if isinstance(price, dict):
-            price = price.get("now") or price.get("amount")
-        if price:
-            online["price"] = f"£{price}" if not str(price).startswith("£") else str(price)
-        # Online stock signals
-        for k in ("isAvailable", "deliverable", "deliveryAvailable", "isInStock"):
-            if prod.get(k) is True:
-                online["available"] = True
-                break
-        avail = prod.get("availability") or prod.get("onlineStockStatus")
-        if isinstance(avail, str) and avail.upper() in ("INSTOCK", "IN_STOCK", "AVAILABLE"):
-            online["available"] = True
-
-    # Store stock — varies, try common keys
-    stores_list = (
-        pp.get("stores")
-        or pp.get("storeStock")
-        or (pp.get("storeAvailability") or {}).get("stores")
-        or []
-    )
-    if isinstance(stores_list, list):
-        for s in stores_list:
-            if not isinstance(s, dict):
+    # Pull product name + price from the JSON-LD @graph (most reliable)
+    for ld_match in re.finditer(
+        r'<script type="application/ld\+json"[^>]*>(.+?)</script>', html, re.DOTALL
+    ):
+        try:
+            d = json.loads(ld_match.group(1))
+        except Exception:
+            continue
+        graph = d.get("@graph") if isinstance(d, dict) else None
+        items = graph if isinstance(graph, list) else [d]
+        for it in items:
+            if not isinstance(it, dict):
                 continue
-            name = s.get("name") or s.get("storeName") or ""
-            if STORE_NAME_ARGOS.lower() in name.lower():
-                stk = s.get("stock") or s
-                store = {
-                    "name": name,
-                    "stockLevel": stk.get("stockLevel") or stk.get("level") or "",
-                    "isInStock": bool(stk.get("isInStock") or stk.get("inStock") or
-                                      (str(stk.get("stockLevel", "")).upper() in ("GREEN", "AMBER"))),
-                }
-                break
+            if it.get("@type") == "Product":
+                title = title or it.get("name", "")
+                offer = it.get("offers")
+                if isinstance(offer, dict):
+                    price = offer.get("price")
+                    if price:
+                        online["price"] = f"£{price}"
+                    avail = (offer.get("availability") or "").lower()
+                    if "instock" in avail or "in_stock" in avail:
+                        online["available"] = True
 
-    return title, online, store
+    # Stock signals from rendered HTML — Argos shows "Add to trolley" / "Out of stock" buttons
+    # server-side, which is more reliable than JSON-LD's optional availability field.
+    if re.search(r'add\s*to\s*trolley', html, re.IGNORECASE):
+        online["available"] = True
+    if re.search(r'(out of stock|currently unavailable|sorry,?\s*this item)', html, re.IGNORECASE):
+        # OOS signal overrides — Argos sometimes renders both the disabled button and the OOS text
+        if not re.search(r'reservation\s*(only|available)', html, re.IGNORECASE):
+            online["available"] = False
+
+    return title, online
 
 
 def _argos_extract(payload: dict | list) -> tuple[str, dict, dict]:
@@ -650,6 +606,10 @@ def _argos_extract(payload: dict | list) -> tuple[str, dict, dict]:
 
 
 async def check_argos(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
+    """Argos: plain httpx GET of the product page (NOT a browser).
+    Akamai blocks Chromium fingerprints + the finder-api endpoint specifically, but
+    serves the product page HTML happily to a regular HTTP client through a UK residential proxy.
+    Per-store stock isn't accessible — we monitor online stock only."""
     if "argos" in DISABLED:
         return state
     if not ARGOS_PRODUCT_URLS:
@@ -658,53 +618,33 @@ async def check_argos(state: dict, client: httpx.AsyncClient, context: BrowserCo
 
     log.info("Checking Argos (%d products)...", len(ARGOS_PRODUCT_URLS))
     argos_state: dict[str, dict] = state.setdefault("argos", {})
-    page_title = ""
 
-    for url in ARGOS_PRODUCT_URLS:
-        pid = argos_id_from_url(url)
-        if not pid:
-            log.warning("Argos: cannot extract id from %s", url)
-            continue
+    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers, **proxy_kwargs) as session:
+        for url in ARGOS_PRODUCT_URLS:
+            pid = argos_id_from_url(url)
+            if not pid:
+                log.warning("Argos: cannot extract id from %s", url)
+                continue
 
-        page = await context.new_page()
-        next_payload: dict | None = None
-        finder_payload: dict | None = None
-        page_title = ""
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=35_000)
-            await page.wait_for_timeout(4000)
-            page_title = await page.evaluate(
-                "document.querySelector('h1')?.innerText?.trim() || ''"
-            )
-            # Strategy 1: __NEXT_DATA__ from server-rendered HTML (works even when API blocked)
-            next_payload = await _argos_next_data(page)
-            # Strategy 2: finder-api in-page fetch (may 403 if Akamai blocks the endpoint)
-            finder_payload = await _argos_finder_in_page(page, pid, STORE_POSTCODE)
-        except Exception as exc:
-            log.error("Argos %s navigation failed: %s", pid, exc)
-        finally:
             try:
-                await page.close()
-            except Exception:
-                pass
+                resp = await session.get(url)
+            except Exception as exc:
+                log.error("Argos %s request failed: %s", pid, exc)
+                continue
 
-        # Merge: prefer finder-api (richer per-store stock), fall back to __NEXT_DATA__
-        title, online, store = "", {"available": False, "price": ""}, {}
-        if finder_payload is not None:
-            title, online, store = _argos_extract(finder_payload)
-        if next_payload is not None and (not title or not store):
-            t2, o2, s2 = _argos_extract_from_next(next_payload)
-            title = title or t2
-            if not online.get("available") and o2.get("available"):
-                online = o2
-            if not store and s2:
-                store = s2
+            if resp.status_code != 200:
+                log.warning("Argos %s: HTTP %s — proxy IP may be Akamai-blocked, will retry next round", pid, resp.status_code)
+                continue
 
-        if not title and not online.get("available") and not store:
-            log.warning("Argos %s: no usable data from finder-api or __NEXT_DATA__ — page may be Akamai-blocked", pid)
-            continue
-
-        title = title or page_title or argos_state.get(pid, {}).get("title", f"Argos #{pid}")
+            title, online = _argos_parse_html(resp.text)
+            title = title or argos_state.get(pid, {}).get("title", f"Argos #{pid}")
+            store: dict[str, Any] = {}  # per-store stock not available without browser; skip
 
         prev = argos_state.get(pid, {})
         prev_online = bool(prev.get("online_available"))
