@@ -498,13 +498,24 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
 
 def _argos_parse_html(html: str) -> tuple[str, dict]:
     """Extract title, price, and online availability from the Argos product page HTML.
-    Online availability is signalled by the presence of an 'addToTrolley' control in the
-    server-rendered markup (Akamai blocks the finder-api, but the product page itself loads
-    cleanly through a UK residential proxy)."""
+
+    Stock signal: the `globallyOutOfStock` boolean embedded in the inline product-state JSON.
+    `false` = sellable somewhere on Argos right now. `true` = nationally OOS.
+
+    Why not other signals:
+      - JSON-LD's `availability` field is often missing on Argos
+      - `<button>Add to trolley</button>` is rendered client-side, not in static HTML —
+        regex-matching the literal string `add to trolley` finds JS bundle vars, not the real button
+      - `deliverable: true` is a static product attribute (sells via delivery channel),
+        not a real-time stock flag
+      - `/finder-api/...` (the per-postcode/per-store check) is hard-blocked by Akamai
+
+    This signal cannot tell us about Slough store stock — that requires the blocked finder-api.
+    """
     title = ""
     online = {"available": False, "price": ""}
 
-    # Pull product name + price from the JSON-LD @graph (most reliable)
+    # Title + price from JSON-LD @graph
     for ld_match in re.finditer(
         r'<script type="application/ld\+json"[^>]*>(.+?)</script>', html, re.DOTALL
     ):
@@ -515,27 +526,21 @@ def _argos_parse_html(html: str) -> tuple[str, dict]:
         graph = d.get("@graph") if isinstance(d, dict) else None
         items = graph if isinstance(graph, list) else [d]
         for it in items:
-            if not isinstance(it, dict):
-                continue
-            if it.get("@type") == "Product":
+            if isinstance(it, dict) and it.get("@type") == "Product":
                 title = title or it.get("name", "")
                 offer = it.get("offers")
                 if isinstance(offer, dict):
                     price = offer.get("price")
                     if price:
                         online["price"] = f"£{price}"
-                    avail = (offer.get("availability") or "").lower()
-                    if "instock" in avail or "in_stock" in avail:
-                        online["available"] = True
 
-    # Stock signals from rendered HTML — Argos shows "Add to trolley" / "Out of stock" buttons
-    # server-side, which is more reliable than JSON-LD's optional availability field.
-    if re.search(r'add\s*to\s*trolley', html, re.IGNORECASE):
-        online["available"] = True
-    if re.search(r'(out of stock|currently unavailable|sorry,?\s*this item)', html, re.IGNORECASE):
-        # OOS signal overrides — Argos sometimes renders both the disabled button and the OOS text
-        if not re.search(r'reservation\s*(only|available)', html, re.IGNORECASE):
-            online["available"] = False
+    # Live stock: extract `globallyOutOfStock` from inline state JSON
+    m = re.search(r'"globallyOutOfStock"\s*:\s*(true|false)', html)
+    if m:
+        online["available"] = (m.group(1) == "false")
+    else:
+        # Couldn't find the flag — be conservative, treat as unknown / OOS
+        online["available"] = False
 
     return title, online
 
