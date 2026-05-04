@@ -773,13 +773,10 @@ async def check_john_lewis(state: dict, client: httpx.AsyncClient) -> dict:
         price_match = re.search(r"£[\d,]+(?:\.\d{2})?", card_text)
         price = price_match.group(0) if price_match else "N/A"
 
-        lower = card_text.lower()
-        available = not (
-            "out of stock" in lower
-            or "sold out" in lower
-            or "unavailable" in lower
-            or "temporarily unavailable" in lower
-        )
+        # John Lewis search only lists buyable products — treat presence as in stock.
+        # The previous loose 'unavailable' word match flapped per render (matched random
+        # promo/disclaimer copy inside the card), spamming restocked/OOS alerts.
+        available = True
 
         # Dedup by stable product_id (data-product-id), NOT by parsed title — title
         # extraction can pick slightly different markup across renders.
