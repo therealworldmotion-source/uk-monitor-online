@@ -781,7 +781,9 @@ async def check_john_lewis(state: dict, client: httpx.AsyncClient) -> dict:
             or "temporarily unavailable" in lower
         )
 
-        key = product_key(title)
+        # Dedup by stable product_id (data-product-id), NOT by parsed title — title
+        # extraction can pick slightly different markup across renders.
+        key = pid or product_key(title)
         current[key] = {"title": title, "url": url, "price": price, "available": available, "product_id": pid}
 
     if not current:
@@ -905,7 +907,8 @@ async def check_very(state: dict, client: httpx.AsyncClient) -> dict:
         if "out of stock" in card_text or "sold out" in card_text or "unavailable" in card_text:
             available = False
 
-        key = product_key(title)
+        # Dedup by stable Constructor.io product id, not parsed title.
+        key = pid or product_key(title)
         current[key] = {"title": title, "url": url, "price": price, "available": available, "product_id": pid}
 
     if not current:
@@ -1020,12 +1023,15 @@ async def check_menkind(state: dict, client: httpx.AsyncClient, context: Browser
             oos_el = item.select_one("[class*='sold-out'], [class*='out-of-stock'], [class*='unavailable']")
             available = not oos_el
 
-            key = product_key(title)
+            # Dedup by stable BigCommerce product id (data-entity-id), not parsed title
+            pid = item.get("data-entity-id") or item.get("data-product-id") or ""
+            key = pid or product_key(title)
             current[key] = {
                 "title": title,
                 "url": url,
                 "price": price,
                 "available": available,
+                "product_id": pid,
             }
 
         if not current:
@@ -1096,8 +1102,11 @@ BROWSER_REFRESH = 3_600  # rotate context hourly
 async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> None:
     state = load_state()
 
-    # Always re-baseline Menkind on each start so user gets a fresh in-stock list
+    # Always re-baseline whole-category retailers on each start so user gets a fresh
+    # in-stock list (and so state-schema migrations land cleanly).
     state["menkind"] = {}
+    state["john_lewis"] = {}
+    state["very"] = {}
 
     CHECK_STATUS: dict[str, dict] = {
         "smyths":     {"label": "🧸 Smyths",     "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
