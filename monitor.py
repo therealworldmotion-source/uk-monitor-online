@@ -59,10 +59,17 @@ MENKIND_URL = os.environ.get(
     "https://www.menkind.co.uk/search.php?BigCommerceX%5Bquery%5D=pokemon+TCG",
 )
 
+# John Lewis category / search URL (Pokemon TCG). Whole-category scrape, no per-product list needed.
+JOHN_LEWIS_URL = os.environ.get(
+    "JOHN_LEWIS_URL",
+    "https://www.johnlewis.com/search?search-term=pokemon%20tcg",
+)
+
 # Check intervals (seconds). Defaults are sane — override per-retailer if needed.
 INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "180"))
 INTERVAL_ARGOS = int(os.environ.get("INTERVAL_ARGOS", "180"))
 INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "180"))
+INTERVAL_JOHN_LEWIS = int(os.environ.get("INTERVAL_JOHN_LEWIS", "180"))
 
 # Imperva bypass — see resolve_smyths_ip() docstring
 IMPERVA_DNS = os.environ.get("IMPERVA_DNS", "1.1.1.1")
@@ -692,6 +699,132 @@ async def check_argos(state: dict, client: httpx.AsyncClient, context: BrowserCo
     return state
 
 
+# ─── JOHN LEWIS ───────────────────────────────────────────────────────────────
+
+def _fmt_jl(prod: dict, icon: str = "") -> str:
+    icon = icon or ("✅" if prod.get("available") else "❌")
+    price = prod.get("price", "")
+    price_str = f" — {price}" if price and price != "N/A" else ""
+    title = prod.get("title", "Unknown")
+    url = prod.get("url", "")
+    return f"  {icon} <a href=\"{url}\">{title}</a>{price_str}"
+
+
+async def check_john_lewis(state: dict, client: httpx.AsyncClient) -> dict:
+    """John Lewis: scrape the Pokemon TCG search page via httpx + proxy.
+    The whole search-result HTML is server-rendered with `<article data-product-id>` cards
+    containing title, price, and href. Stock signal: presence of 'out of stock' / 'unavailable'
+    text within the card markup."""
+    if "john_lewis" in DISABLED:
+        return state
+
+    log.info("Checking John Lewis...")
+    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers, **proxy_kwargs) as session:
+            resp = await session.get(JOHN_LEWIS_URL)
+        if resp.status_code != 200:
+            log.warning("John Lewis: HTTP %s — proxy IP may be blocked, will retry next round", resp.status_code)
+            return state
+    except Exception as exc:
+        log.error("John Lewis request failed: %s", exc)
+        return state
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    current: dict[str, dict] = {}
+
+    for card in soup.select("article[data-product-id]"):
+        pid = card.get("data-product-id") or ""
+        # Title: first non-empty text from any title-like element
+        title = ""
+        for sel in ('[data-testid="product-title"]', '[class*="Title"]', "h2", "h3"):
+            for el in card.select(sel):
+                t = el.get_text(strip=True)
+                if t and len(t) > 2:
+                    title = t
+                    break
+            if title:
+                break
+        if not title or len(title) < 3:
+            continue
+
+        link_el = card.select_one('a[href*="/p"]')
+        href = link_el.get("href", "") if link_el else ""
+        url = href if href.startswith("http") else f"https://www.johnlewis.com{href}"
+
+        card_text = card.get_text(separator=" ", strip=True)
+        price_match = re.search(r"£[\d,]+(?:\.\d{2})?", card_text)
+        price = price_match.group(0) if price_match else "N/A"
+
+        lower = card_text.lower()
+        available = not (
+            "out of stock" in lower
+            or "sold out" in lower
+            or "unavailable" in lower
+            or "temporarily unavailable" in lower
+        )
+
+        key = product_key(title)
+        current[key] = {"title": title, "url": url, "price": price, "available": available, "product_id": pid}
+
+    if not current:
+        log.warning("John Lewis: no products found — selectors may need updating")
+        return state
+
+    log.info("John Lewis: %d products parsed", len(current))
+
+    prev = state.get("john_lewis", {})
+    first_run = len(prev) == 0
+
+    if first_run:
+        in_stock = [v for v in current.values() if v["available"]]
+        out_stock = [v for v in current.values() if not v["available"]]
+        lines = [f"<b>🛒 JOHN LEWIS — Monitoring Started</b>",
+                 f"<i>{len(current)} Pokemon TCG products tracked</i>"]
+        if in_stock:
+            lines.append("\n✅ <b>In Stock:</b>")
+            for p in in_stock[:25]:
+                lines.append(_fmt_jl(p))
+            if len(in_stock) > 25:
+                lines.append(f"  …and {len(in_stock) - 25} more in-stock")
+        if out_stock:
+            lines.append(f"\n❌ <b>Out of Stock:</b> {len(out_stock)}")
+        await send_telegram("\n".join(lines), client)
+    else:
+        new_p, restocked, went_oos = [], [], []
+        for pid, prod in current.items():
+            if pid not in prev:
+                new_p.append(prod)
+            elif prod["available"] != prev[pid].get("available"):
+                (restocked if prod["available"] else went_oos).append(prod)
+
+        if new_p:
+            lines = [f"<b>🆕 JOHN LEWIS — {len(new_p)} New Product(s)</b>"]
+            for p in new_p:
+                lines.append(_fmt_jl(p))
+            await send_telegram("\n".join(lines), client)
+        if restocked:
+            lines = ["<b>🟢 JOHN LEWIS — Back In Stock</b>"]
+            for p in restocked:
+                lines.append(_fmt_jl(p, "✅"))
+            await send_telegram("\n".join(lines), client)
+        if went_oos:
+            lines = ["<b>🔴 JOHN LEWIS — Out of Stock</b>"]
+            for p in went_oos:
+                lines.append(_fmt_jl(p, "❌"))
+            await send_telegram("\n".join(lines), client)
+        if not (new_p or restocked or went_oos):
+            log.info("John Lewis: no changes")
+
+    state["john_lewis"] = current
+    return state
+
+
 # ─── MENKIND ──────────────────────────────────────────────────────────────────
 
 def _fmt_menkind(prod: dict, icon: str = "") -> str:
@@ -824,9 +957,10 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
     state["menkind"] = {}
 
     CHECK_STATUS: dict[str, dict] = {
-        "smyths":  {"label": "🧸 Smyths",  "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
-        "argos":   {"label": "🛍️ Argos",   "ok": None, "time": "", "interval": INTERVAL_ARGOS},
-        "menkind": {"label": "🎁 Menkind", "ok": None, "time": "", "interval": INTERVAL_MENKIND},
+        "smyths":     {"label": "🧸 Smyths",     "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
+        "argos":      {"label": "🛍️ Argos",      "ok": None, "time": "", "interval": INTERVAL_ARGOS},
+        "menkind":    {"label": "🎁 Menkind",    "ok": None, "time": "", "interval": INTERVAL_MENKIND},
+        "john_lewis": {"label": "🛒 John Lewis", "ok": None, "time": "", "interval": INTERVAL_JOHN_LEWIS},
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
@@ -872,7 +1006,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
         FAIL_COUNTS[site] = 0
         FAIL_ALERTED[site] = False
 
-    last = {"smyths": 0.0, "argos": 0.0, "menkind": 0.0, "rotate": 0.0}
+    last = {"smyths": 0.0, "argos": 0.0, "menkind": 0.0, "john_lewis": 0.0, "rotate": 0.0}
 
     context = await make_context(browser)
     smyths_context = await make_context(smyths_browser) if smyths_browser else context
@@ -940,6 +1074,21 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
                 await _push_status()
                 await asyncio.sleep(random.uniform(1, 3))
 
+            # ── John Lewis (HTTP only — no browser) ───────────────────
+            if "john_lewis" not in DISABLED and now - last["john_lewis"] >= INTERVAL_JOHN_LEWIS:
+                try:
+                    state = await check_john_lewis(state, client)
+                    _mark("john_lewis", bool(state.get("john_lewis")))
+                    _track_success("john_lewis")
+                except Exception as exc:
+                    log.error("John Lewis loop error: %s", exc)
+                    _mark("john_lewis", False)
+                    await _track_failure("john_lewis", str(exc))
+                save_state(state)
+                last["john_lewis"] = now
+                await _push_status()
+                await asyncio.sleep(random.uniform(1, 3))
+
             # ── Menkind ───────────────────────────────────────────────
             if "menkind" not in DISABLED and now - last["menkind"] >= INTERVAL_MENKIND:
                 try:
@@ -991,7 +1140,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
 
     await send_telegram(
         "🤖 <b>UK Pokemon TCG Monitor online.</b>\n\n"
-        f"Tracking: Smyths ({len(SMYTHS_PRODUCT_URLS)}) · Argos ({len(ARGOS_PRODUCT_URLS)}) · Menkind (category)\n"
+        f"Tracking: Smyths ({len(SMYTHS_PRODUCT_URLS)}) · Argos ({len(ARGOS_PRODUCT_URLS)}) · Menkind · John Lewis\n"
         f"Slough postcode: <code>{STORE_POSTCODE}</code>\n\n"
         "Send <code>start</code> to begin, <code>stop</code> to pause, <code>status</code> for state.",
         client,
@@ -1009,7 +1158,8 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
             "✅ <b>Monitor started</b>\n\n"
             f"🧸 Smyths every {INTERVAL_SMYTHS // 60} min\n"
             f"🛍️ Argos every {INTERVAL_ARGOS // 60} min\n"
-            f"🎁 Menkind every {INTERVAL_MENKIND // 60} min",
+            f"🎁 Menkind every {INTERVAL_MENKIND // 60} min\n"
+            f"🛒 John Lewis every {INTERVAL_JOHN_LEWIS // 60} min",
             client,
         )
 
