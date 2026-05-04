@@ -28,6 +28,11 @@ import httpx
 from bs4 import BeautifulSoup
 from patchright.async_api import BrowserContext, async_playwright
 
+try:
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+except Exception:
+    CurlAsyncSession = None  # type: ignore
+
 # ─── ENV CONFIG ───────────────────────────────────────────────────────────────
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
@@ -844,22 +849,33 @@ def _fmt_very(prod: dict, icon: str = "") -> str:
 
 
 async def check_very(state: dict, client: httpx.AsyncClient) -> dict:
-    """Very: scrape the Pokemon TCG search page via httpx + proxy.
-    Product cards expose all metadata as data-cnstrc-* attributes (Constructor.io tagging),
-    which makes parsing trivial. Listings only show buyable items, so presence == in stock."""
+    """Very: scrape the Pokemon TCG search page via curl_cffi + proxy.
+
+    NB: Very's WAF does TLS fingerprinting. Plain httpx through the proxy 200s from
+    a Mac but consistently 403s from Railway (Linux + slightly different OpenSSL).
+    curl_cffi with `impersonate='chrome120'` mimics Chrome's exact TLS profile and
+    sails through every time."""
     if "very" in DISABLED:
+        return state
+    if CurlAsyncSession is None:
+        log.error("Very: curl_cffi unavailable — skipping")
         return state
 
     log.info("Checking Very...")
-    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
     headers = {
-        "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-GB,en;q=0.9",
     }
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers, **proxy_kwargs) as session:
-            resp = await session.get(VERY_URL)
+        async with CurlAsyncSession() as session:
+            resp = await session.get(
+                VERY_URL,
+                headers=headers,
+                proxies=proxies,
+                impersonate="chrome120",
+                timeout=25,
+            )
         if resp.status_code != 200:
             log.warning("Very: HTTP %s — proxy IP may be blocked, will retry next round", resp.status_code)
             return state
