@@ -790,49 +790,34 @@ async def check_john_lewis(state: dict, client: httpx.AsyncClient) -> dict:
     log.info("John Lewis: %d products parsed", len(current))
 
     prev = state.get("john_lewis", {})
-    first_run = len(prev) == 0
+    # JL's search ranks by relevance, which rotates products in/out of the top N each call.
+    # If we treat "new this cycle" as "alert", we get noise as products bounce in and out.
+    # Instead we track every pid ever seen and only fire "new" the first time.
+    seen_ever = set(state.get("john_lewis_seen", []))
+    first_run = len(prev) == 0 and not seen_ever
 
     if first_run:
-        in_stock = [v for v in current.values() if v["available"]]
-        out_stock = [v for v in current.values() if not v["available"]]
         lines = [f"<b>🛒 JOHN LEWIS — Monitoring Started</b>",
-                 f"<i>{len(current)} Pokemon TCG products tracked</i>"]
-        if in_stock:
-            lines.append("\n✅ <b>In Stock:</b>")
-            for p in in_stock[:25]:
-                lines.append(_fmt_jl(p))
-            if len(in_stock) > 25:
-                lines.append(f"  …and {len(in_stock) - 25} more in-stock")
-        if out_stock:
-            lines.append(f"\n❌ <b>Out of Stock:</b> {len(out_stock)}")
+                 f"<i>{len(current)} Pokemon TCG products tracked</i>",
+                 "\n✅ <b>In Stock:</b>"]
+        for p in list(current.values())[:25]:
+            lines.append(_fmt_jl(p))
+        if len(current) > 25:
+            lines.append(f"  …and {len(current) - 25} more")
         await send_telegram("\n".join(lines), client)
     else:
-        new_p, restocked, went_oos = [], [], []
-        for pid, prod in current.items():
-            if pid not in prev:
-                new_p.append(prod)
-            elif prod["available"] != prev[pid].get("available"):
-                (restocked if prod["available"] else went_oos).append(prod)
-
+        new_p = [prod for pid, prod in current.items() if pid not in seen_ever]
         if new_p:
             lines = [f"<b>🆕 JOHN LEWIS — {len(new_p)} New Product(s)</b>"]
             for p in new_p:
                 lines.append(_fmt_jl(p))
             await send_telegram("\n".join(lines), client)
-        if restocked:
-            lines = ["<b>🟢 JOHN LEWIS — Back In Stock</b>"]
-            for p in restocked:
-                lines.append(_fmt_jl(p, "✅"))
-            await send_telegram("\n".join(lines), client)
-        if went_oos:
-            lines = ["<b>🔴 JOHN LEWIS — Out of Stock</b>"]
-            for p in went_oos:
-                lines.append(_fmt_jl(p, "❌"))
-            await send_telegram("\n".join(lines), client)
-        if not (new_p or restocked or went_oos):
+        else:
             log.info("John Lewis: no changes")
 
+    seen_ever.update(current.keys())
     state["john_lewis"] = current
+    state["john_lewis_seen"] = sorted(seen_ever)
     return state
 
 
@@ -915,56 +900,33 @@ async def check_very(state: dict, client: httpx.AsyncClient) -> dict:
     log.info("Very: %d products parsed", len(current))
 
     prev = state.get("very", {})
-    first_run = len(prev) == 0
+    # Same volatility pattern as John Lewis: search ranks change so products rotate
+    # in/out of the visible page. Only fire "new" for pids never seen before.
+    seen_ever = set(state.get("very_seen", []))
+    first_run = len(prev) == 0 and not seen_ever
 
     if first_run:
-        in_stock = [v for v in current.values() if v["available"]]
-        out_stock = [v for v in current.values() if not v["available"]]
         lines = [f"<b>🟣 VERY — Monitoring Started</b>",
-                 f"<i>{len(current)} Pokemon TCG products tracked</i>"]
-        if in_stock:
-            lines.append("\n✅ <b>In Stock:</b>")
-            for p in in_stock[:25]:
-                lines.append(_fmt_very(p))
-            if len(in_stock) > 25:
-                lines.append(f"  …and {len(in_stock) - 25} more in-stock")
-        if out_stock:
-            lines.append(f"\n❌ <b>Out of Stock:</b> {len(out_stock)}")
+                 f"<i>{len(current)} Pokemon TCG products tracked</i>",
+                 "\n✅ <b>In Stock:</b>"]
+        for p in list(current.values())[:25]:
+            lines.append(_fmt_very(p))
+        if len(current) > 25:
+            lines.append(f"  …and {len(current) - 25} more")
         await send_telegram("\n".join(lines), client)
     else:
-        new_p, restocked, went_oos = [], [], []
-        prev_ids = {v.get("product_id") for v in prev.values()}
-        cur_ids = {v.get("product_id") for v in current.values()}
-        for pid, prod in current.items():
-            if pid not in prev:
-                # If it's a brand-new product (not in prev at all), flag as new
-                new_p.append(prod)
-            elif prod["available"] != prev[pid].get("available"):
-                (restocked if prod["available"] else went_oos).append(prod)
-        # Products that disappeared from the listing → treat as no-longer-available
-        for pid in prev:
-            if pid not in current:
-                went_oos.append(prev[pid])
-
+        new_p = [prod for pid, prod in current.items() if pid not in seen_ever]
         if new_p:
             lines = [f"<b>🆕 VERY — {len(new_p)} New Product(s)</b>"]
             for p in new_p:
                 lines.append(_fmt_very(p))
             await send_telegram("\n".join(lines), client)
-        if restocked:
-            lines = ["<b>🟢 VERY — Back In Stock</b>"]
-            for p in restocked:
-                lines.append(_fmt_very(p, "✅"))
-            await send_telegram("\n".join(lines), client)
-        if went_oos:
-            lines = ["<b>🔴 VERY — No Longer Listed / Out of Stock</b>"]
-            for p in went_oos:
-                lines.append(_fmt_very(p, "❌"))
-            await send_telegram("\n".join(lines), client)
-        if not (new_p or restocked or went_oos):
+        else:
             log.info("Very: no changes")
 
+    seen_ever.update(current.keys())
     state["very"] = current
+    state["very_seen"] = sorted(seen_ever)
     return state
 
 
@@ -1036,49 +998,32 @@ async def check_menkind(state: dict, client: httpx.AsyncClient, context: Browser
             return state
 
         prev = state.get("menkind", {})
-        first_run = len(prev) == 0
+        # Same volatility pattern as JL/Very. Algolia search ranking can rotate cards.
+        seen_ever = set(state.get("menkind_seen", []))
+        first_run = len(prev) == 0 and not seen_ever
 
         if first_run:
-            in_stock = [v for v in current.values() if v["available"]]
-            out_stock = [v for v in current.values() if not v["available"]]
             lines = [f"<b>🎁 MENKIND — Monitoring Started</b>",
-                     f"<i>{len(current)} Pokemon TCG-related products tracked</i>"]
-            if in_stock:
-                lines.append("\n✅ <b>In Stock:</b>")
-                for p in in_stock[:25]:
-                    lines.append(_fmt_menkind(p))
-                if len(in_stock) > 25:
-                    lines.append(f"  …and {len(in_stock) - 25} more in-stock")
-            if out_stock:
-                lines.append(f"\n❌ <b>Out of Stock:</b> {len(out_stock)}")
+                     f"<i>{len(current)} Pokemon TCG-related products tracked</i>",
+                     "\n✅ <b>In Stock:</b>"]
+            for p in list(current.values())[:25]:
+                lines.append(_fmt_menkind(p))
+            if len(current) > 25:
+                lines.append(f"  …and {len(current) - 25} more")
             await send_telegram("\n".join(lines), client)
         else:
-            new_p, restocked, went_oos = [], [], []
-            for pid, prod in current.items():
-                if pid not in prev:
-                    new_p.append(prod)
-                elif prod["available"] != prev[pid].get("available"):
-                    (restocked if prod["available"] else went_oos).append(prod)
-
+            new_p = [prod for pid, prod in current.items() if pid not in seen_ever]
             if new_p:
                 lines = [f"<b>🆕 MENKIND — {len(new_p)} New Product(s)</b>"]
                 for p in new_p:
                     lines.append(_fmt_menkind(p))
                 await send_telegram("\n".join(lines), client)
-            if restocked:
-                lines = ["<b>🟢 MENKIND — Back In Stock</b>"]
-                for p in restocked:
-                    lines.append(_fmt_menkind(p, "✅"))
-                await send_telegram("\n".join(lines), client)
-            if went_oos:
-                lines = ["<b>🔴 MENKIND — Out of Stock</b>"]
-                for p in went_oos:
-                    lines.append(_fmt_menkind(p, "❌"))
-                await send_telegram("\n".join(lines), client)
-            if not (new_p or restocked or went_oos):
+            else:
                 log.info("Menkind: no changes")
 
+        seen_ever.update(current.keys())
         state["menkind"] = current
+        state["menkind_seen"] = sorted(seen_ever)
 
     except Exception as exc:
         log.error("Menkind check failed: %s", exc)
