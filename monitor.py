@@ -76,12 +76,15 @@ VERY_URL = os.environ.get(
     "https://www.very.co.uk/e/q/pokemon%20tcg.end",
 )
 
-# Check intervals (seconds). Defaults are sane — override per-retailer if needed.
-INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "180"))
-INTERVAL_ARGOS = int(os.environ.get("INTERVAL_ARGOS", "180"))
-INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "180"))
-INTERVAL_JOHN_LEWIS = int(os.environ.get("INTERVAL_JOHN_LEWIS", "180"))
-INTERVAL_VERY = int(os.environ.get("INTERVAL_VERY", "180"))
+# Check intervals (seconds). Defaults tuned for Webshare $1.30/GB:
+#   Smyths/Argos = 10 min (per-product, time-sensitive)
+#   Menkind/JL/Very = 30 min (whole-category scans, new products rare)
+# Override via env vars if you want tighter polling and have the bandwidth budget.
+INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "600"))
+INTERVAL_ARGOS = int(os.environ.get("INTERVAL_ARGOS", "600"))
+INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "1800"))
+INTERVAL_JOHN_LEWIS = int(os.environ.get("INTERVAL_JOHN_LEWIS", "1800"))
+INTERVAL_VERY = int(os.environ.get("INTERVAL_VERY", "1800"))
 
 # Imperva bypass — see resolve_smyths_ip() docstring
 IMPERVA_DNS = os.environ.get("IMPERVA_DNS", "1.1.1.1")
@@ -320,13 +323,24 @@ def resolve_smyths_ip() -> str | None:
 async def make_context(browser) -> BrowserContext:
     # Patchright already does its own deep stealth; add_init_script tweaks here BREAK
     # navigation against Imperva-protected sites (causes ERR_NAME_NOT_RESOLVED). Don't add one.
-    return await browser.new_context(
+    ctx = await browser.new_context(
         user_agent=random.choice(USER_AGENTS),
         viewport=random.choice(VIEWPORTS),
         locale="en-GB",
         timezone_id="Europe/London",
         java_script_enabled=True,
     )
+    # Bandwidth: every byte on this context flows through the metered Webshare proxy.
+    # Block all non-essential resource types — we only need HTML + JS (for Imperva
+    # sensor cookies + the in-page API fetches). Saves ~80% of bandwidth per page load.
+    async def _block_heavy(route):
+        rt = route.request.resource_type
+        if rt in ("image", "media", "font", "stylesheet"):
+            await route.abort()
+        else:
+            await route.continue_()
+    await ctx.route("**/*", _block_heavy)
+    return ctx
 
 
 def _parse_proxy_url(url: str) -> dict | None:
@@ -394,10 +408,12 @@ async def _smyths_api_call(page, path: str) -> dict | None:
 
 
 async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
-    """For each Smyths product URL, fetch online + Slough store stock via in-page API.
-    Imperva serves a JS challenge interstitial on first paint — we wait ~12s for
-    sensor cookies to be set, then call the internal APIs which honour those cookies.
-    Inventory endpoint occasionally still 403s independently — treated as best-effort."""
+    """Fetch Slough store + online stock for each configured Smyths product.
+
+    Bandwidth-optimised: loads ONE Smyths page per cycle to warm Imperva sensor
+    cookies, then calls the internal API for every product from that single page
+    via `fetch()` — saves ~5× browser navigations vs hitting each product page.
+    Resource blocking (images/CSS/fonts/media) further trims the warm-up page itself."""
     if "smyths" in DISABLED:
         return state
     if not SMYTHS_PRODUCT_URLS:
@@ -407,18 +423,20 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
     log.info("Checking Smyths (%d products)...", len(SMYTHS_PRODUCT_URLS))
     smyths_state: dict[str, dict] = state.setdefault("smyths", {})
 
-    for url in SMYTHS_PRODUCT_URLS:
-        pid = smyths_id_from_url(url)
-        if not pid:
-            log.warning("Smyths: cannot extract id from %s", url)
-            continue
-
-        page = await context.new_page()
-        store_data: dict | None = None
-        inv_data: dict | None = None
+    page = await context.new_page()
+    try:
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=35_000)
+            await page.goto(SMYTHS_PRODUCT_URLS[0], wait_until="domcontentloaded", timeout=35_000)
             await page.wait_for_timeout(12_000)  # let Imperva sensor cookies settle
+        except Exception as exc:
+            log.error("Smyths warm-up failed: %s — skipping cycle", exc)
+            return state
+
+        for url in SMYTHS_PRODUCT_URLS:
+            pid = smyths_id_from_url(url)
+            if not pid:
+                log.warning("Smyths: cannot extract id from %s", url)
+                continue
 
             store_path = (
                 f"/api/uk/en-gb/store-pickup/pointOfServices?productId={pid}"
@@ -427,87 +445,78 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
             )
             inv_path = f"/api/uk/en-gb/product/product-inventory?code={pid}&userId=anonymous&bundle=false"
 
-            store_data = await _smyths_api_call(page, store_path)
-            if store_data is None:
-                # One retry after another sensor-cookie window
-                await page.wait_for_timeout(6_000)
-                store_data = await _smyths_api_call(page, store_path)
-
-            inv_data = await _smyths_api_call(page, inv_path)
-        except Exception as exc:
-            log.error("Smyths %s: %s", pid, exc)
-        finally:
             try:
-                await page.close()
-            except Exception:
-                pass
+                store_data = await _smyths_api_call(page, store_path)
+                if store_data is None:
+                    await page.wait_for_timeout(3_000)
+                    store_data = await _smyths_api_call(page, store_path)
+                inv_data = await _smyths_api_call(page, inv_path)
+            except Exception as exc:
+                log.warning("Smyths %s: API call error: %s", pid, exc)
+                continue
 
-        if not store_data:
-            log.warning("Smyths %s: store-pickup API blocked (Imperva 403) — skipping this round", pid)
-            continue
+            if not store_data:
+                log.warning("Smyths %s: store-pickup API blocked (Imperva 403) — skipping", pid)
+                continue
 
-        title = smyths_state.get(pid, {}).get("title") or f"Smyths #{pid}"
-        # Try to lift product title from inventory payload if we got it
-        if isinstance(inv_data, dict):
-            t = inv_data.get("name") or inv_data.get("title") or (inv_data.get("product") or {}).get("name")
-            if t:
-                title = t
+            title = smyths_state.get(pid, {}).get("title") or f"Smyths #{pid}"
+            if isinstance(inv_data, dict):
+                t = inv_data.get("name") or inv_data.get("title") or (inv_data.get("product") or {}).get("name")
+                if t:
+                    title = t
 
-        stores = store_data.get("stores", []) or []
-        slough = next((s for s in stores if s.get("name", "").lower() == STORE_NAME_SMYTHS.lower()), None)
-        store_status = slough.get("stockLevelStatusCode") or slough.get("stockStatusMessage") or "UNKNOWN" if slough else "NO_STORE"
+            stores = store_data.get("stores", []) or []
+            slough = next((s for s in stores if s.get("name", "").lower() == STORE_NAME_SMYTHS.lower()), None)
+            store_status = (slough.get("stockLevelStatusCode") or slough.get("stockStatusMessage") or "UNKNOWN") if slough else "NO_STORE"
 
-        hd = (inv_data or {}).get("hdSection", {}) if isinstance(inv_data, dict) else {}
-        online_status = hd.get("stockLevelStatus") or hd.get("stockLevel") or "UNKNOWN"
-        expected_date = hd.get("expectedStockDate", "")
+            hd = (inv_data or {}).get("hdSection", {}) if isinstance(inv_data, dict) else {}
+            online_status = hd.get("stockLevelStatus") or hd.get("stockLevel") or "UNKNOWN"
+            expected_date = hd.get("expectedStockDate", "")
 
-        prev = smyths_state.get(pid, {})
-        prev_store = prev.get("store_status", "OUTOFSTOCK")
-        prev_online = prev.get("online_status", "OUTOFSTOCK")
-        prev_expected = prev.get("expected", "")
+            prev = smyths_state.get(pid, {})
+            prev_store = prev.get("store_status", "OUTOFSTOCK")
+            prev_online = prev.get("online_status", "OUTOFSTOCK")
+            prev_expected = prev.get("expected", "")
 
-        log.info("Smyths %s [%s]: store=%s online=%s exp=%s",
-                 pid, title[:40], store_status, online_status, expected_date)
+            log.info("Smyths %s [%s]: store=%s online=%s exp=%s",
+                     pid, title[:40], store_status, online_status, expected_date)
 
-        # Slough store transitions
-        if store_status not in ("OUTOFSTOCK", "NO_STORE", "UNKNOWN") and prev_store in ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN"):
-            await send_telegram(
-                f"🚨 <b>SMYTHS SLOUGH — IN STOCK</b>\n\n"
-                f"{title}\n"
-                f"Store: <b>{store_status}</b>\n"
-                f"<a href=\"{url}\">Buy now →</a>",
-                client,
-            )
-        elif store_status == "OUTOFSTOCK" and prev_store not in ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN"):
-            await send_telegram(f"ℹ️ Smyths Slough: <i>{title}</i> back out of stock.", client)
+            if store_status not in ("OUTOFSTOCK", "NO_STORE", "UNKNOWN") and prev_store in ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN"):
+                await send_telegram(
+                    f"🚨 <b>SMYTHS SLOUGH — IN STOCK</b>\n\n{title}\nStore: <b>{store_status}</b>\n<a href=\"{url}\">Buy now →</a>",
+                    client,
+                )
+            elif store_status == "OUTOFSTOCK" and prev_store not in ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN"):
+                await send_telegram(f"ℹ️ Smyths Slough: <i>{title}</i> back out of stock.", client)
 
-        # Online transitions
-        online_in = isinstance(online_status, str) and online_status.upper() not in ("OUTOFSTOCK", "UNKNOWN", "")
-        prev_online_in = isinstance(prev_online, str) and prev_online.upper() not in ("OUTOFSTOCK", "UNKNOWN", "")
-        if online_in and not prev_online_in:
-            await send_telegram(
-                f"🚨 <b>SMYTHS ONLINE — IN STOCK</b>\n\n"
-                f"{title}\n"
-                f"Status: <b>{online_status}</b>\n"
-                f"<a href=\"{url}\">Buy now →</a>",
-                client,
-            )
-        elif not online_in and prev_online_in:
-            await send_telegram(f"ℹ️ Smyths online: <i>{title}</i> back out of stock.", client)
+            online_in = isinstance(online_status, str) and online_status.upper() not in ("OUTOFSTOCK", "UNKNOWN", "")
+            prev_online_in = isinstance(prev_online, str) and prev_online.upper() not in ("OUTOFSTOCK", "UNKNOWN", "")
+            if online_in and not prev_online_in:
+                await send_telegram(
+                    f"🚨 <b>SMYTHS ONLINE — IN STOCK</b>\n\n{title}\nStatus: <b>{online_status}</b>\n<a href=\"{url}\">Buy now →</a>",
+                    client,
+                )
+            elif not online_in and prev_online_in:
+                await send_telegram(f"ℹ️ Smyths online: <i>{title}</i> back out of stock.", client)
 
-        if expected_date and prev_expected and expected_date != prev_expected:
-            await send_telegram(
-                f"📅 <b>Smyths date changed</b>\n\n{title}\nWas: {prev_expected}\nNow: <b>{expected_date}</b>",
-                client,
-            )
+            if expected_date and prev_expected and expected_date != prev_expected:
+                await send_telegram(
+                    f"📅 <b>Smyths date changed</b>\n\n{title}\nWas: {prev_expected}\nNow: <b>{expected_date}</b>",
+                    client,
+                )
 
-        smyths_state[pid] = {
-            "title": title,
-            "url": url,
-            "store_status": store_status,
-            "online_status": online_status,
-            "expected": expected_date,
-        }
+            smyths_state[pid] = {
+                "title": title,
+                "url": url,
+                "store_status": store_status,
+                "online_status": online_status,
+                "expected": expected_date,
+            }
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
 
     state["smyths"] = smyths_state
     return state
