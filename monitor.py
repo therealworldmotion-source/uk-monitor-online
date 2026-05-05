@@ -76,15 +76,13 @@ VERY_URL = os.environ.get(
     "https://www.very.co.uk/e/q/pokemon%20tcg.end",
 )
 
-# Check intervals (seconds). Defaults tuned for Webshare $1.30/GB:
-#   Smyths/Argos = 10 min (per-product, time-sensitive)
-#   Menkind/JL/Very = 30 min (whole-category scans, new products rare)
-# Override via env vars if you want tighter polling and have the bandwidth budget.
-INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "600"))
-INTERVAL_ARGOS = int(os.environ.get("INTERVAL_ARGOS", "600"))
-INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "1800"))
-INTERVAL_JOHN_LEWIS = int(os.environ.get("INTERVAL_JOHN_LEWIS", "1800"))
-INTERVAL_VERY = int(os.environ.get("INTERVAL_VERY", "1800"))
+# Check intervals (seconds). 2 min everywhere — user prefers fast catch on stock landings.
+# At this rate, expected proxy bandwidth ~1-1.5 GB/day with the resource-blocking optimisations.
+INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "120"))
+INTERVAL_ARGOS = int(os.environ.get("INTERVAL_ARGOS", "120"))
+INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "120"))
+INTERVAL_JOHN_LEWIS = int(os.environ.get("INTERVAL_JOHN_LEWIS", "120"))
+INTERVAL_VERY = int(os.environ.get("INTERVAL_VERY", "120"))
 
 # Imperva bypass — see resolve_smyths_ip() docstring
 IMPERVA_DNS = os.environ.get("IMPERVA_DNS", "1.1.1.1")
