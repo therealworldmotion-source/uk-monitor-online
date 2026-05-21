@@ -69,7 +69,7 @@ PBSTUK_HANDLE = os.environ.get("PBSTUK_HANDLE", "PBSTUK")
 PBSTUK_NITTER_HOSTS = [
     h.strip() for h in os.environ.get(
         "PBSTUK_NITTER_HOSTS",
-        "nitter.net,nitter.poast.org,nitter.privacydev.net",
+        "nitter.net,nitter.poast.org,nitter.cz,nitter.kavin.rocks",
     ).split(",") if h.strip()
 ]
 INTERVAL_PBSTUK = int(os.environ.get("INTERVAL_PBSTUK", "30"))
@@ -634,27 +634,49 @@ def _pbstuk_clean(text: str) -> str:
 
 async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
     """Try each Nitter host in turn until one returns a usable RSS feed.
-    Returns list of {id, link, pubDate, text} ordered newest-first, or None on total failure."""
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
+    Returns list of {id, link, pubDate, text} ordered newest-first, or None on total failure.
+
+    Uses curl_cffi with Chrome TLS impersonation — this produces the same TLS fingerprint as
+    a real Chrome browser, bypassing Cloudflare bot-detection that blocked plain httpx.
+    No proxy needed."""
+    rss_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-GB,en;q=0.9",
+        "Cache-Control": "no-cache",
     }
+
     for host in PBSTUK_NITTER_HOSTS:
         url = f"https://{host}/{PBSTUK_HANDLE}/rss"
         try:
-            r = await client.get(url, headers=headers, timeout=15, follow_redirects=True)
+            if CurlAsyncSession is not None:
+                # Chrome TLS fingerprint — bypasses Cloudflare 403 that plain httpx gets
+                async with CurlAsyncSession(impersonate="chrome120") as sess:
+                    r = await sess.get(url, headers=rss_headers, timeout=15)
+                    status_code = r.status_code
+                    body = r.text
+                    content_type = r.headers.get("content-type", "")
+            else:
+                # Fallback — likely to fail on Cloudflare-protected hosts but worth trying
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=rss_headers) as c:
+                    r = await c.get(url)
+                    status_code = r.status_code
+                    body = r.text
+                    content_type = r.headers.get("content-type", "")
         except Exception as exc:
             log.info("PBSTUK: %s unreachable (%s)", host, exc)
             continue
-        if r.status_code != 200 or "xml" not in (r.headers.get("content-type") or "").lower():
-            log.info("PBSTUK: %s returned %s ct=%s", host, r.status_code, r.headers.get("content-type"))
+
+        if status_code != 200:
+            log.info("PBSTUK: %s returned %s", host, status_code)
             continue
+
         try:
-            root = _ET.fromstring(r.text)
+            root = _ET.fromstring(body)
         except Exception as exc:
             log.warning("PBSTUK: %s gave non-XML body: %s", host, exc)
             continue
+
         items: list[dict] = []
         for it in root.findall(".//item"):
             link = (it.findtext("link") or "").strip()
@@ -670,6 +692,7 @@ async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
         if items:
             log.info("PBSTUK: %d tweets from %s", len(items), host)
             return items
+
     return None
 
 
