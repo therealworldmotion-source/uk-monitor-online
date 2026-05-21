@@ -2,10 +2,10 @@
 """
 UK Pokemon TCG Retailer Monitor — Railway edition
 ─────────────────────────────────────────────────
-Tracks specific Pokemon TCG products across:
-  • Smyths Toys      (per-product, Slough store-stock + online)
-  • Argos            (per-product, Slough store-stock + online)
-  • Menkind          (whole Pokemon TCG category, in-stock alerts + cart permalinks)
+Tracks:
+  • Smyths Toys  (per-product, Slough store-stock + online)
+  • Menkind      (whole Pokemon TCG category, in-stock alerts)
+  • @PBSTUK on X (real-time tweet alerts via Nitter RSS — restock news)
 
 Designed for a single Railway container. State persists to DATA_DIR (mount a 1 GB volume at /data).
 All config via env vars — see README.md.
@@ -47,16 +47,12 @@ TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 SMYTHS_PRODUCT_URLS = [
     u.strip() for u in os.environ.get("SMYTHS_PRODUCT_URLS", "").split(",") if u.strip()
 ]
-ARGOS_PRODUCT_URLS = [
-    u.strip() for u in os.environ.get("ARGOS_PRODUCT_URLS", "").split(",") if u.strip()
-]
 
 # Slough store coordinates — used by Smyths store-pickup API to surface the Slough store first.
 STORE_POSTCODE = os.environ.get("STORE_POSTCODE", "SL2 1EX")
 STORE_LAT = os.environ.get("STORE_LAT", "51.510665")
 STORE_LNG = os.environ.get("STORE_LNG", "-0.59888")
 STORE_NAME_SMYTHS = os.environ.get("STORE_NAME_SMYTHS", "slough")  # case-insensitive match
-STORE_NAME_ARGOS = os.environ.get("STORE_NAME_ARGOS", "slough")    # substring match
 
 # Menkind category URL — Pokemon TCG search results.
 MENKIND_URL = os.environ.get(
@@ -64,25 +60,9 @@ MENKIND_URL = os.environ.get(
     "https://www.menkind.co.uk/search.php?BigCommerceX%5Bquery%5D=pokemon+TCG",
 )
 
-# John Lewis category / search URL (Pokemon TCG). Whole-category scrape, no per-product list needed.
-JOHN_LEWIS_URL = os.environ.get(
-    "JOHN_LEWIS_URL",
-    "https://www.johnlewis.com/search?search-term=pokemon%20tcg",
-)
-
-# Very category URL (Pokemon TCG). The /search/... URL 403s, but /e/q/<term>.end works.
-VERY_URL = os.environ.get(
-    "VERY_URL",
-    "https://www.very.co.uk/e/q/pokemon%20tcg.end",
-)
-
-# Check intervals (seconds). 2 min everywhere — user prefers fast catch on stock landings.
-# At this rate, expected proxy bandwidth ~1-1.5 GB/day with the resource-blocking optimisations.
+# Check intervals (seconds).
 INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "120"))
-INTERVAL_ARGOS = int(os.environ.get("INTERVAL_ARGOS", "120"))
 INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "120"))
-INTERVAL_JOHN_LEWIS = int(os.environ.get("INTERVAL_JOHN_LEWIS", "120"))
-INTERVAL_VERY = int(os.environ.get("INTERVAL_VERY", "120"))
 
 # X / Twitter monitoring — @PBSTUK (Pokemon UK PBST restock alerts)
 PBSTUK_HANDLE = os.environ.get("PBSTUK_HANDLE", "PBSTUK")
@@ -151,7 +131,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             log.warning("State file corrupt, starting fresh")
-    return {"smyths": {}, "argos": {}, "menkind": {}}
+    return {"smyths": {}, "menkind": {}}
 
 
 def save_state(state: dict) -> None:
@@ -280,11 +260,6 @@ def product_key(s: str) -> str:
 
 def smyths_id_from_url(url: str) -> str | None:
     m = re.search(r"/p/(\d+)", url)
-    return m.group(1) if m else None
-
-
-def argos_id_from_url(url: str) -> str | None:
-    m = re.search(r"/product/(\d+)", url)
     return m.group(1) if m else None
 
 
@@ -530,423 +505,6 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
     return state
 
 
-# ─── ARGOS ────────────────────────────────────────────────────────────────────
-
-def _argos_parse_html(html: str) -> tuple[str, dict]:
-    """Extract title, price, and online availability from the Argos product page HTML.
-
-    Stock signal: the `globallyOutOfStock` boolean embedded in the inline product-state JSON.
-    `false` = sellable somewhere on Argos right now. `true` = nationally OOS.
-
-    Why not other signals:
-      - JSON-LD's `availability` field is often missing on Argos
-      - `<button>Add to trolley</button>` is rendered client-side, not in static HTML —
-        regex-matching the literal string `add to trolley` finds JS bundle vars, not the real button
-      - `deliverable: true` is a static product attribute (sells via delivery channel),
-        not a real-time stock flag
-      - `/finder-api/...` (the per-postcode/per-store check) is hard-blocked by Akamai
-
-    This signal cannot tell us about Slough store stock — that requires the blocked finder-api.
-    """
-    title = ""
-    online = {"available": False, "price": ""}
-
-    # Title + price from JSON-LD @graph
-    for ld_match in re.finditer(
-        r'<script type="application/ld\+json"[^>]*>(.+?)</script>', html, re.DOTALL
-    ):
-        try:
-            d = json.loads(ld_match.group(1))
-        except Exception:
-            continue
-        graph = d.get("@graph") if isinstance(d, dict) else None
-        items = graph if isinstance(graph, list) else [d]
-        for it in items:
-            if isinstance(it, dict) and it.get("@type") == "Product":
-                title = title or it.get("name", "")
-                offer = it.get("offers")
-                if isinstance(offer, dict):
-                    price = offer.get("price")
-                    if price:
-                        online["price"] = f"£{price}"
-
-    # Live stock: extract `globallyOutOfStock` from inline state JSON
-    m = re.search(r'"globallyOutOfStock"\s*:\s*(true|false)', html)
-    if m:
-        online["available"] = (m.group(1) == "false")
-    else:
-        # Couldn't find the flag — be conservative, treat as unknown / OOS
-        online["available"] = False
-
-    return title, online
-
-
-def _argos_extract(payload: dict | list) -> tuple[str, dict, dict]:
-    """Best-effort parse of Argos finder-api response. Returns (title, online_info, store_info_for_slough).
-    online_info  = {"available": bool, "price": str}
-    store_info   = {"name": str, "stockLevel": str, "isInStock": bool}  (or {})"""
-    title = ""
-    online = {"available": False, "price": ""}
-    store: dict[str, Any] = {}
-
-    # Drill into common shapes
-    data = payload
-    if isinstance(payload, dict):
-        if "response" in payload and isinstance(payload["response"], dict):
-            data = payload["response"].get("data", payload["response"])
-        elif "data" in payload:
-            data = payload["data"]
-
-    items = data if isinstance(data, list) else [data]
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        prod = item.get("product") or item.get("attributes") or item
-        if isinstance(prod, dict):
-            title = prod.get("name") or prod.get("title") or title
-            price = prod.get("price") or prod.get("nowPrice") or ""
-            if isinstance(price, dict):
-                price = price.get("now") or price.get("amount") or ""
-            if price:
-                online["price"] = f"£{price}" if not str(price).startswith("£") else str(price)
-            # Online availability flags vary
-            for k in ("deliverable", "deliveryAvailable", "isAvailable", "isInStock"):
-                if prod.get(k) is True:
-                    online["available"] = True
-                    break
-            online_status = prod.get("onlineStockStatus") or prod.get("availability")
-            if isinstance(online_status, str) and online_status.upper() in ("INSTOCK", "IN_STOCK", "AVAILABLE"):
-                online["available"] = True
-
-        # Stores list — varied keys
-        stores = (
-            item.get("stores")
-            or item.get("storeStock")
-            or (item.get("availability", {}) or {}).get("stores")
-            or []
-        )
-        if isinstance(stores, list):
-            for s in stores:
-                if not isinstance(s, dict):
-                    continue
-                name = (s.get("name") or s.get("storeName") or "").strip()
-                if STORE_NAME_ARGOS.lower() in name.lower():
-                    stk = s.get("stock") or s
-                    store = {
-                        "name": name,
-                        "stockLevel": stk.get("stockLevel") or stk.get("level") or "",
-                        "isInStock": bool(stk.get("isInStock") or stk.get("inStock") or
-                                          (stk.get("stockLevel", "").upper() in ("GREEN", "AMBER"))),
-                    }
-                    break
-        if title or store:
-            break
-
-    return title, online, store
-
-
-async def check_argos(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
-    """Argos: plain httpx GET of the product page (NOT a browser).
-    Akamai blocks Chromium fingerprints + the finder-api endpoint specifically, but
-    serves the product page HTML happily to a regular HTTP client through a UK residential proxy.
-    Per-store stock isn't accessible — we monitor online stock only."""
-    if "argos" in DISABLED:
-        return state
-    if not ARGOS_PRODUCT_URLS:
-        log.info("Argos: no products configured (ARGOS_PRODUCT_URLS empty)")
-        return state
-
-    log.info("Checking Argos (%d products)...", len(ARGOS_PRODUCT_URLS))
-    argos_state: dict[str, dict] = state.setdefault("argos", {})
-
-    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9",
-    }
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers, **proxy_kwargs) as session:
-        for url in ARGOS_PRODUCT_URLS:
-            pid = argos_id_from_url(url)
-            if not pid:
-                log.warning("Argos: cannot extract id from %s", url)
-                continue
-
-            try:
-                resp = await session.get(url)
-            except Exception as exc:
-                log.error("Argos %s request failed: %s", pid, exc)
-                continue
-
-            if resp.status_code != 200:
-                log.warning("Argos %s: HTTP %s — proxy IP may be Akamai-blocked, will retry next round", pid, resp.status_code)
-                continue
-
-            title, online = _argos_parse_html(resp.text)
-            title = title or argos_state.get(pid, {}).get("title", f"Argos #{pid}")
-            store: dict[str, Any] = {}  # per-store stock not available without browser; skip
-
-        prev = argos_state.get(pid, {})
-        prev_online = bool(prev.get("online_available"))
-        prev_store_in = bool(prev.get("store_in_stock"))
-
-        log.info("Argos %s [%s]: online=%s store=%s",
-                 pid, title[:40], online["available"],
-                 f"{store.get('name', '-')}/{store.get('stockLevel', '-')}")
-
-        if online["available"] and not prev_online:
-            price = f" — {online['price']}" if online.get("price") else ""
-            await send_telegram(
-                f"🚨 <b>ARGOS ONLINE — IN STOCK</b>\n\n{title}{price}\n<a href=\"{url}\">Buy now →</a>",
-                client,
-            )
-        elif not online["available"] and prev_online:
-            await send_telegram(f"ℹ️ Argos online: <i>{title}</i> back out of stock.", client)
-
-        if store.get("isInStock") and not prev_store_in:
-            await send_telegram(
-                f"🚨 <b>ARGOS {store.get('name', 'SLOUGH').upper()} — IN STOCK</b>\n\n"
-                f"{title}\nLevel: <b>{store.get('stockLevel', 'YES')}</b>\n"
-                f"<a href=\"{url}\">Reserve / buy →</a>",
-                client,
-            )
-        elif not store.get("isInStock") and prev_store_in:
-            await send_telegram(f"ℹ️ Argos {store.get('name', 'Slough')}: <i>{title}</i> back out of stock.", client)
-
-        argos_state[pid] = {
-            "title": title,
-            "url": url,
-            "online_available": online["available"],
-            "online_price": online.get("price", ""),
-            "store_in_stock": bool(store.get("isInStock")),
-            "store_level": store.get("stockLevel", ""),
-            "store_name": store.get("name", ""),
-        }
-
-    state["argos"] = argos_state
-    return state
-
-
-# ─── JOHN LEWIS ───────────────────────────────────────────────────────────────
-
-def _fmt_jl(prod: dict, icon: str = "") -> str:
-    icon = icon or ("✅" if prod.get("available") else "❌")
-    price = prod.get("price", "")
-    price_str = f" — {price}" if price and price != "N/A" else ""
-    title = prod.get("title", "Unknown")
-    url = prod.get("url", "")
-    return f"  {icon} <a href=\"{url}\">{title}</a>{price_str}"
-
-
-async def check_john_lewis(state: dict, client: httpx.AsyncClient) -> dict:
-    """John Lewis: scrape the Pokemon TCG search page via httpx + proxy.
-    The whole search-result HTML is server-rendered with `<article data-product-id>` cards
-    containing title, price, and href. Stock signal: presence of 'out of stock' / 'unavailable'
-    text within the card markup."""
-    if "john_lewis" in DISABLED:
-        return state
-
-    log.info("Checking John Lewis...")
-    proxy_kwargs = {"proxy": PROXY_URL} if PROXY_URL else {}
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers, **proxy_kwargs) as session:
-            resp = await session.get(JOHN_LEWIS_URL)
-        if resp.status_code != 200:
-            log.warning("John Lewis: HTTP %s — proxy IP may be blocked, will retry next round", resp.status_code)
-            return state
-    except Exception as exc:
-        log.error("John Lewis request failed: %s", exc)
-        return state
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    current: dict[str, dict] = {}
-
-    for card in soup.select("article[data-product-id]"):
-        pid = card.get("data-product-id") or ""
-        # Title: first non-empty text from any title-like element
-        title = ""
-        for sel in ('[data-testid="product-title"]', '[class*="Title"]', "h2", "h3"):
-            for el in card.select(sel):
-                t = el.get_text(strip=True)
-                if t and len(t) > 2:
-                    title = t
-                    break
-            if title:
-                break
-        if not title or len(title) < 3:
-            continue
-
-        link_el = card.select_one('a[href*="/p"]')
-        href = link_el.get("href", "") if link_el else ""
-        url = href if href.startswith("http") else f"https://www.johnlewis.com{href}"
-
-        card_text = card.get_text(separator=" ", strip=True)
-        price_match = re.search(r"£[\d,]+(?:\.\d{2})?", card_text)
-        price = price_match.group(0) if price_match else "N/A"
-
-        # John Lewis search only lists buyable products — treat presence as in stock.
-        # The previous loose 'unavailable' word match flapped per render (matched random
-        # promo/disclaimer copy inside the card), spamming restocked/OOS alerts.
-        available = True
-
-        # Dedup by stable product_id (data-product-id), NOT by parsed title — title
-        # extraction can pick slightly different markup across renders.
-        key = pid or product_key(title)
-        current[key] = {"title": title, "url": url, "price": price, "available": available, "product_id": pid}
-
-    if not current:
-        log.warning("John Lewis: no products found — selectors may need updating")
-        return state
-
-    log.info("John Lewis: %d products parsed", len(current))
-
-    prev = state.get("john_lewis", {})
-    # JL's search ranks by relevance, which rotates products in/out of the top N each call.
-    # If we treat "new this cycle" as "alert", we get noise as products bounce in and out.
-    # Instead we track every pid ever seen and only fire "new" the first time.
-    seen_ever = set(state.get("john_lewis_seen", []))
-    first_run = len(prev) == 0 and not seen_ever
-
-    if first_run:
-        lines = [f"<b>🛒 JOHN LEWIS — Monitoring Started</b>",
-                 f"<i>{len(current)} Pokemon TCG products tracked</i>",
-                 "\n✅ <b>In Stock:</b>"]
-        for p in list(current.values())[:25]:
-            lines.append(_fmt_jl(p))
-        if len(current) > 25:
-            lines.append(f"  …and {len(current) - 25} more")
-        await send_telegram("\n".join(lines), client)
-    else:
-        new_p = [prod for pid, prod in current.items() if pid not in seen_ever]
-        if new_p:
-            lines = [f"<b>🆕 JOHN LEWIS — {len(new_p)} New Product(s)</b>"]
-            for p in new_p:
-                lines.append(_fmt_jl(p))
-            await send_telegram("\n".join(lines), client)
-        else:
-            log.info("John Lewis: no changes")
-
-    seen_ever.update(current.keys())
-    state["john_lewis"] = current
-    state["john_lewis_seen"] = sorted(seen_ever)
-    return state
-
-
-# ─── VERY ─────────────────────────────────────────────────────────────────────
-
-def _fmt_very(prod: dict, icon: str = "") -> str:
-    icon = icon or ("✅" if prod.get("available") else "❌")
-    price = prod.get("price", "")
-    price_str = f" — {price}" if price and price != "N/A" else ""
-    title = prod.get("title", "Unknown")
-    url = prod.get("url", "")
-    return f"  {icon} <a href=\"{url}\">{title}</a>{price_str}"
-
-
-async def check_very(state: dict, client: httpx.AsyncClient) -> dict:
-    """Very: scrape the Pokemon TCG search page via curl_cffi + proxy.
-
-    NB: Very's WAF does TLS fingerprinting. Plain httpx through the proxy 200s from
-    a Mac but consistently 403s from Railway (Linux + slightly different OpenSSL).
-    curl_cffi with `impersonate='chrome120'` mimics Chrome's exact TLS profile and
-    sails through every time."""
-    if "very" in DISABLED:
-        return state
-    if CurlAsyncSession is None:
-        log.error("Very: curl_cffi unavailable — skipping")
-        return state
-
-    log.info("Checking Very...")
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9",
-    }
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-    try:
-        async with CurlAsyncSession() as session:
-            resp = await session.get(
-                VERY_URL,
-                headers=headers,
-                proxies=proxies,
-                impersonate="chrome120",
-                timeout=25,
-            )
-        if resp.status_code != 200:
-            log.warning("Very: HTTP %s — proxy IP may be blocked, will retry next round", resp.status_code)
-            return state
-    except Exception as exc:
-        log.error("Very request failed: %s", exc)
-        return state
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    current: dict[str, dict] = {}
-
-    for card in soup.select('[data-testid="gallery-product-card"]'):
-        pid = card.get("data-cnstrc-item-id") or card.get("data-tagg-id") or ""
-        title = card.get("data-cnstrc-item-name") or ""
-        if not title or len(title) < 3:
-            continue
-        price_raw = card.get("data-cnstrc-item-price") or ""
-        price = f"£{price_raw}" if price_raw else "N/A"
-
-        link_el = card.select_one("a[href]")
-        href = link_el.get("href", "") if link_el else ""
-        url = href if href.startswith("http") else f"https://www.very.co.uk{href}"
-
-        # Listings only include buyable products on Very — assume in stock if present
-        available = True
-        # Belt-and-braces: any explicit OOS marker text inside the card overrides
-        card_text = card.get_text(separator=" ", strip=True).lower()
-        if "out of stock" in card_text or "sold out" in card_text or "unavailable" in card_text:
-            available = False
-
-        # Dedup by stable Constructor.io product id, not parsed title.
-        key = pid or product_key(title)
-        current[key] = {"title": title, "url": url, "price": price, "available": available, "product_id": pid}
-
-    if not current:
-        log.warning("Very: no products found — selectors may need updating")
-        return state
-
-    log.info("Very: %d products parsed", len(current))
-
-    prev = state.get("very", {})
-    # Same volatility pattern as John Lewis: search ranks change so products rotate
-    # in/out of the visible page. Only fire "new" for pids never seen before.
-    seen_ever = set(state.get("very_seen", []))
-    first_run = len(prev) == 0 and not seen_ever
-
-    if first_run:
-        lines = [f"<b>🟣 VERY — Monitoring Started</b>",
-                 f"<i>{len(current)} Pokemon TCG products tracked</i>",
-                 "\n✅ <b>In Stock:</b>"]
-        for p in list(current.values())[:25]:
-            lines.append(_fmt_very(p))
-        if len(current) > 25:
-            lines.append(f"  …and {len(current) - 25} more")
-        await send_telegram("\n".join(lines), client)
-    else:
-        new_p = [prod for pid, prod in current.items() if pid not in seen_ever]
-        if new_p:
-            lines = [f"<b>🆕 VERY — {len(new_p)} New Product(s)</b>"]
-            for p in new_p:
-                lines.append(_fmt_very(p))
-            await send_telegram("\n".join(lines), client)
-        else:
-            log.info("Very: no changes")
-
-    seen_ever.update(current.keys())
-    state["very"] = current
-    state["very_seen"] = sorted(seen_ever)
-    return state
-
-
 # ─── MENKIND ──────────────────────────────────────────────────────────────────
 
 def _fmt_menkind(prod: dict, icon: str = "") -> str:
@@ -1015,7 +573,7 @@ async def check_menkind(state: dict, client: httpx.AsyncClient, context: Browser
             return state
 
         prev = state.get("menkind", {})
-        # Same volatility pattern as JL/Very. Algolia search ranking can rotate cards.
+        # Algolia search ranking can rotate cards — track every pid ever seen and only fire 'new' once.
         seen_ever = set(state.get("menkind_seen", []))
         first_run = len(prev) == 0 and not seen_ever
 
@@ -1164,19 +722,13 @@ BROWSER_REFRESH = 3_600  # rotate context hourly
 async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> None:
     state = load_state()
 
-    # Always re-baseline whole-category retailers on each start so user gets a fresh
-    # in-stock list (and so state-schema migrations land cleanly).
+    # Re-baseline whole-category retailers on each start so user gets a fresh in-stock list
     state["menkind"] = {}
-    state["john_lewis"] = {}
-    state["very"] = {}
 
     CHECK_STATUS: dict[str, dict] = {
-        "smyths":     {"label": "🧸 Smyths",       "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
-        "argos":      {"label": "🛍️ Argos",        "ok": None, "time": "", "interval": INTERVAL_ARGOS},
-        "menkind":    {"label": "🎁 Menkind",      "ok": None, "time": "", "interval": INTERVAL_MENKIND},
-        "john_lewis": {"label": "🛒 John Lewis",   "ok": None, "time": "", "interval": INTERVAL_JOHN_LEWIS},
-        "very":       {"label": "🟣 Very",         "ok": None, "time": "", "interval": INTERVAL_VERY},
-        "pbstuk":     {"label": "🐦 @PBSTUK feed", "ok": None, "time": "", "interval": INTERVAL_PBSTUK},
+        "smyths":  {"label": "🧸 Smyths",       "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
+        "menkind": {"label": "🎁 Menkind",      "ok": None, "time": "", "interval": INTERVAL_MENKIND},
+        "pbstuk":  {"label": "🐦 @PBSTUK feed", "ok": None, "time": "", "interval": INTERVAL_PBSTUK},
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
@@ -1222,7 +774,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
         FAIL_COUNTS[site] = 0
         FAIL_ALERTED[site] = False
 
-    last = {"smyths": 0.0, "argos": 0.0, "menkind": 0.0, "john_lewis": 0.0, "very": 0.0, "pbstuk": 0.0, "rotate": 0.0}
+    last = {"smyths": 0.0, "menkind": 0.0, "pbstuk": 0.0, "rotate": 0.0}
 
     context = await make_context(browser)
     smyths_context = await make_context(smyths_browser) if smyths_browser else context
@@ -1269,27 +821,6 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
                 await _push_status()
                 await asyncio.sleep(random.uniform(1, 3))
 
-            # ── Argos (in-page fetch via headless Chrome) ─────────────
-            if "argos" not in DISABLED and ARGOS_PRODUCT_URLS and now - last["argos"] >= INTERVAL_ARGOS:
-                try:
-                    state = await check_argos(state, client, context)
-                    _mark("argos", True)
-                    _track_success("argos")
-                except Exception as exc:
-                    log.error("Argos loop error: %s", exc)
-                    _mark("argos", False)
-                    await _track_failure("argos", str(exc))
-                    if "Connection closed" in str(exc) or "Target page" in str(exc):
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
-                        context = await make_context(browser)
-                save_state(state)
-                last["argos"] = now
-                await _push_status()
-                await asyncio.sleep(random.uniform(1, 3))
-
             # ── @PBSTUK Twitter watcher (HTTP, no proxy, fast cadence) ─
             if "pbstuk" not in DISABLED and now - last["pbstuk"] >= INTERVAL_PBSTUK:
                 try:
@@ -1302,36 +833,6 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
                     await _track_failure("pbstuk", str(exc))
                 save_state(state)
                 last["pbstuk"] = now
-
-            # ── Very (HTTP only — no browser) ─────────────────────────
-            if "very" not in DISABLED and now - last["very"] >= INTERVAL_VERY:
-                try:
-                    state = await check_very(state, client)
-                    _mark("very", bool(state.get("very")))
-                    _track_success("very")
-                except Exception as exc:
-                    log.error("Very loop error: %s", exc)
-                    _mark("very", False)
-                    await _track_failure("very", str(exc))
-                save_state(state)
-                last["very"] = now
-                await _push_status()
-                await asyncio.sleep(random.uniform(1, 3))
-
-            # ── John Lewis (HTTP only — no browser) ───────────────────
-            if "john_lewis" not in DISABLED and now - last["john_lewis"] >= INTERVAL_JOHN_LEWIS:
-                try:
-                    state = await check_john_lewis(state, client)
-                    _mark("john_lewis", bool(state.get("john_lewis")))
-                    _track_success("john_lewis")
-                except Exception as exc:
-                    log.error("John Lewis loop error: %s", exc)
-                    _mark("john_lewis", False)
-                    await _track_failure("john_lewis", str(exc))
-                save_state(state)
-                last["john_lewis"] = now
-                await _push_status()
-                await asyncio.sleep(random.uniform(1, 3))
 
             # ── Menkind ───────────────────────────────────────────────
             if "menkind" not in DISABLED and now - last["menkind"] >= INTERVAL_MENKIND:
@@ -1384,7 +885,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
 
     await send_telegram(
         "🤖 <b>UK Pokemon TCG Monitor online.</b>\n\n"
-        f"Tracking: Smyths ({len(SMYTHS_PRODUCT_URLS)}) · Argos ({len(ARGOS_PRODUCT_URLS)}) · Menkind · John Lewis · Very\n"
+        f"Tracking: Smyths ({len(SMYTHS_PRODUCT_URLS)}) · Menkind · @{PBSTUK_HANDLE}\n"
         f"Slough postcode: <code>{STORE_POSTCODE}</code>\n\n"
         "Send <code>start</code> to begin, <code>stop</code> to pause, <code>status</code> for state.",
         client,
@@ -1401,10 +902,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
         await send_telegram(
             "✅ <b>Monitor started</b>\n\n"
             f"🧸 Smyths every {INTERVAL_SMYTHS // 60} min\n"
-            f"🛍️ Argos every {INTERVAL_ARGOS // 60} min\n"
             f"🎁 Menkind every {INTERVAL_MENKIND // 60} min\n"
-            f"🛒 John Lewis every {INTERVAL_JOHN_LEWIS // 60} min\n"
-            f"🟣 Very every {INTERVAL_VERY // 60} min\n"
             f"🐦 @{PBSTUK_HANDLE} every {INTERVAL_PBSTUK}s",
             client,
         )
@@ -1453,7 +951,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
 async def main() -> None:
     log.info("=" * 60)
     log.info("UK Pokemon TCG Monitor — starting")
-    log.info("Smyths products: %d  Argos products: %d", len(SMYTHS_PRODUCT_URLS), len(ARGOS_PRODUCT_URLS))
+    log.info("Smyths products: %d  Menkind: category-scrape  PBSTUK: every %ds", len(SMYTHS_PRODUCT_URLS), INTERVAL_PBSTUK)
     log.info("Postcode: %s   Disabled: %s", STORE_POSTCODE, sorted(DISABLED) or "none")
     log.info("Telegram: %s", "ENABLED" if TELEGRAM_ENABLED else "DISABLED (will log to stdout)")
     log.info("=" * 60)
