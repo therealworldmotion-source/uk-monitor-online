@@ -622,7 +622,7 @@ async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
         r = await client.get(
             "https://api.twitter.com/2/tweets/search/recent",
             params={
-                "query": f"from:{PBSTUK_HANDLE} -is:retweet",
+                "query": f"from:{PBSTUK_HANDLE} -is:retweet -is:reply",
                 "tweet.fields": "created_at,text",
                 "max_results": "10",
             },
