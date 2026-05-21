@@ -612,20 +612,24 @@ async def check_menkind(state: dict, client: httpx.AsyncClient, context: Browser
 # Telegram. Requires TWITTER_BEARER_TOKEN env var (free dev account, no proxy).
 
 
-async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
+async def _pbstuk_fetch(client: httpx.AsyncClient, since_id: str | None = None) -> list[dict] | None:
     """Fetch @PBSTUK tweets via Twitter API v2.
-    Returns list of {id, link, pubDate, text} newest-first, or None on failure."""
+    Pass since_id to only fetch tweets newer than that ID (zero usage when nothing new).
+    Returns list of {id, link, pubDate, text} newest-first, [] if none new, None on failure."""
     if not TWITTER_BEARER_TOKEN:
         log.warning("PBSTUK: TWITTER_BEARER_TOKEN not set — cannot fetch tweets")
         return None
+    params: dict = {
+        "query": f"from:{PBSTUK_HANDLE} -is:retweet -is:reply",
+        "tweet.fields": "created_at,text",
+        "max_results": "10",
+    }
+    if since_id:
+        params["since_id"] = since_id
     try:
         r = await client.get(
             "https://api.twitter.com/2/tweets/search/recent",
-            params={
-                "query": f"from:{PBSTUK_HANDLE} -is:retweet -is:reply",
-                "tweet.fields": "created_at,text",
-                "max_results": "10",
-            },
+            params=params,
             headers={"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"},
             timeout=15,
         )
@@ -638,7 +642,7 @@ async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
         return None
 
     tweets = r.json().get("data") or []
-    items = [
+    return [
         {
             "id": t["id"],
             "link": f"https://x.com/{PBSTUK_HANDLE}/status/{t['id']}",
@@ -647,49 +651,51 @@ async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
         }
         for t in tweets
     ]
-    log.info("PBSTUK: %d tweets from Twitter API v2", len(items))
-    return items or None
 
 
 async def check_pbstuk(state: dict, client: httpx.AsyncClient) -> dict:
-    """Fan new @PBSTUK tweets to Telegram. Dedup by stable tweet ID stored in state."""
+    """Fan new @PBSTUK tweets to Telegram. Uses since_id so the API only returns
+    genuinely new tweets — zero usage when @PBSTUK hasn't posted."""
     if "pbstuk" in DISABLED:
         return state
-    items = await _pbstuk_fetch(client)
-    if not items:
-        log.warning("PBSTUK: no Nitter host returned a usable feed this round")
-        return state
 
-    seen = set(state.get("pbstuk_seen", []))
-    first_run = not seen
+    newest_id: str | None = state.get("pbstuk_newest_id")
 
-    if first_run:
-        # Don't blast 20 historical tweets on first start — just baseline the IDs.
-        seen.update(it["id"] for it in items)
-        latest = items[0]
-        await send_telegram(
-            f"🐦 <b>@{PBSTUK_HANDLE} watcher armed</b>\n\n"
-            f"Baselined {len(items)} recent tweets. New tweets from here on will alert.\n\n"
-            f"Latest:\n<i>{latest['text'][:300]}</i>\n<a href=\"{latest['link']}\">view</a>",
-            client,
-        )
-    else:
-        new_items = [it for it in items if it["id"] not in seen]
-        # Oldest first so the chat reads naturally
-        new_items.reverse()
-        for it in new_items:
-            text = it["text"][:1500] or "(no text)"
+    if not newest_id:
+        # First ever run — baseline silently so we don't spam old tweets.
+        items = await _pbstuk_fetch(client)  # no since_id: get recent tweets
+        if items is None:
+            return state
+        if items:
+            newest_id = items[0]["id"]  # highest ID = most recent
+            state["pbstuk_newest_id"] = newest_id
+            latest = items[0]
             await send_telegram(
-                f"🐦 <b>@{PBSTUK_HANDLE}</b> · <i>{it['pubDate']}</i>\n\n"
-                f"{text}\n\n<a href=\"{it['link']}\">view tweet</a>",
+                f"🐦 <b>@{PBSTUK_HANDLE} watcher armed</b>\n\n"
+                f"Baselined {len(items)} recent tweets. Will alert on new ones only.\n\n"
+                f"Latest: <i>{latest['text'][:300]}</i>\n<a href=\"{latest['link']}\">view</a>",
                 client,
             )
-            seen.add(it["id"])
-        if not new_items:
-            log.info("PBSTUK: no new tweets")
+        return state
 
-    # Trim seen-set so state doesn't grow unbounded (keep ~500 newest IDs)
-    state["pbstuk_seen"] = sorted(seen, reverse=True)[:500]
+    # Normal run — only fetch tweets newer than the last one we saw.
+    items = await _pbstuk_fetch(client, since_id=newest_id)
+    if items is None:
+        return state  # API error — try again next cycle
+    if not items:
+        log.info("PBSTUK: no new tweets")
+        return state
+
+    # Alert oldest-first so the chat reads in order.
+    for it in reversed(items):
+        await send_telegram(
+            f"🐦 <b>@{PBSTUK_HANDLE}</b> · <i>{it['pubDate']}</i>\n\n"
+            f"{it['text'][:1500]}\n\n<a href=\"{it['link']}\">view tweet</a>",
+            client,
+        )
+
+    # Store the newest ID seen so next call only gets tweets after this.
+    state["pbstuk_newest_id"] = items[0]["id"]
     return state
 
 
