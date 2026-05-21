@@ -66,12 +66,7 @@ INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "120"))
 
 # X / Twitter monitoring — @PBSTUK (Pokemon UK PBST restock alerts)
 PBSTUK_HANDLE = os.environ.get("PBSTUK_HANDLE", "PBSTUK")
-PBSTUK_NITTER_HOSTS = [
-    h.strip() for h in os.environ.get(
-        "PBSTUK_NITTER_HOSTS",
-        "nitter.net,nitter.poast.org,nitter.cz,nitter.kavin.rocks",
-    ).split(",") if h.strip()
-]
+TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN", "").strip()
 INTERVAL_PBSTUK = int(os.environ.get("INTERVAL_PBSTUK", "30"))
 
 # Imperva bypass — see resolve_smyths_ip() docstring
@@ -613,87 +608,47 @@ async def check_menkind(state: dict, client: httpx.AsyncClient, context: Browser
 
 
 # ─── @PBSTUK X/TWITTER MONITOR ────────────────────────────────────────────────
-# Polls a Nitter mirror's RSS feed every INTERVAL_PBSTUK seconds. New tweets
-# (anything with a status ID not previously seen) get fanned out to Telegram.
-# Uses a list of Nitter hosts in priority order; falls through to the next on
-# 4xx/5xx. No proxy — Nitter is public and not geo-blocked.
-
-import xml.etree.ElementTree as _ET
-from html import unescape as _html_unescape
-
-_PBSTUK_LINK_RE = re.compile(r"/status/(\d+)")
-_PBSTUK_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def _pbstuk_clean(text: str) -> str:
-    """Strip Nitter's HTML wrap + collapse whitespace. Leaves the user-typed tweet text."""
-    s = _PBSTUK_TAG_RE.sub(" ", text or "")
-    s = _html_unescape(s)
-    return " ".join(s.split()).strip()
+# Polls Twitter API v2 every INTERVAL_PBSTUK seconds. New tweets get fanned to
+# Telegram. Requires TWITTER_BEARER_TOKEN env var (free dev account, no proxy).
 
 
 async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
-    """Try each Nitter host in turn until one returns a usable RSS feed.
-    Returns list of {id, link, pubDate, text} ordered newest-first, or None on total failure.
+    """Fetch @PBSTUK tweets via Twitter API v2.
+    Returns list of {id, link, pubDate, text} newest-first, or None on failure."""
+    if not TWITTER_BEARER_TOKEN:
+        log.warning("PBSTUK: TWITTER_BEARER_TOKEN not set — cannot fetch tweets")
+        return None
+    try:
+        r = await client.get(
+            "https://api.twitter.com/2/tweets/search/recent",
+            params={
+                "query": f"from:{PBSTUK_HANDLE} -is:retweet",
+                "tweet.fields": "created_at,text",
+                "max_results": "10",
+            },
+            headers={"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"},
+            timeout=15,
+        )
+    except Exception as exc:
+        log.warning("PBSTUK: Twitter API error: %s", exc)
+        return None
 
-    Uses curl_cffi with Chrome TLS impersonation — this produces the same TLS fingerprint as
-    a real Chrome browser, bypassing Cloudflare bot-detection that blocked plain httpx.
-    No proxy needed."""
-    rss_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Cache-Control": "no-cache",
-    }
+    if r.status_code != 200:
+        log.warning("PBSTUK: Twitter API returned %s: %s", r.status_code, r.text[:200])
+        return None
 
-    for host in PBSTUK_NITTER_HOSTS:
-        url = f"https://{host}/{PBSTUK_HANDLE}/rss"
-        try:
-            if CurlAsyncSession is not None:
-                # Chrome TLS fingerprint — bypasses Cloudflare 403 that plain httpx gets
-                async with CurlAsyncSession(impersonate="chrome120") as sess:
-                    r = await sess.get(url, headers=rss_headers, timeout=15)
-                    status_code = r.status_code
-                    body = r.text
-                    content_type = r.headers.get("content-type", "")
-            else:
-                # Fallback — likely to fail on Cloudflare-protected hosts but worth trying
-                async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=rss_headers) as c:
-                    r = await c.get(url)
-                    status_code = r.status_code
-                    body = r.text
-                    content_type = r.headers.get("content-type", "")
-        except Exception as exc:
-            log.info("PBSTUK: %s unreachable (%s)", host, exc)
-            continue
-
-        if status_code != 200:
-            log.info("PBSTUK: %s returned %s", host, status_code)
-            continue
-
-        try:
-            root = _ET.fromstring(body)
-        except Exception as exc:
-            log.warning("PBSTUK: %s gave non-XML body: %s", host, exc)
-            continue
-
-        items: list[dict] = []
-        for it in root.findall(".//item"):
-            link = (it.findtext("link") or "").strip()
-            m = _PBSTUK_LINK_RE.search(link)
-            if not m:
-                continue
-            items.append({
-                "id": m.group(1),
-                "link": link.split("#")[0].replace(f"https://{host}/", "https://x.com/"),
-                "pubDate": (it.findtext("pubDate") or "").strip(),
-                "text": _pbstuk_clean(it.findtext("description") or it.findtext("title") or ""),
-            })
-        if items:
-            log.info("PBSTUK: %d tweets from %s", len(items), host)
-            return items
-
-    return None
+    tweets = r.json().get("data") or []
+    items = [
+        {
+            "id": t["id"],
+            "link": f"https://x.com/{PBSTUK_HANDLE}/status/{t['id']}",
+            "pubDate": t.get("created_at", ""),
+            "text": t.get("text", ""),
+        }
+        for t in tweets
+    ]
+    log.info("PBSTUK: %d tweets from Twitter API v2", len(items))
+    return items or None
 
 
 async def check_pbstuk(state: dict, client: httpx.AsyncClient) -> dict:
