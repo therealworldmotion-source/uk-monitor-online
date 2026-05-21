@@ -84,6 +84,16 @@ INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "120"))
 INTERVAL_JOHN_LEWIS = int(os.environ.get("INTERVAL_JOHN_LEWIS", "120"))
 INTERVAL_VERY = int(os.environ.get("INTERVAL_VERY", "120"))
 
+# X / Twitter monitoring — @PBSTUK (Pokemon UK PBST restock alerts)
+PBSTUK_HANDLE = os.environ.get("PBSTUK_HANDLE", "PBSTUK")
+PBSTUK_NITTER_HOSTS = [
+    h.strip() for h in os.environ.get(
+        "PBSTUK_NITTER_HOSTS",
+        "nitter.net,nitter.poast.org,nitter.privacydev.net",
+    ).split(",") if h.strip()
+]
+INTERVAL_PBSTUK = int(os.environ.get("INTERVAL_PBSTUK", "30"))
+
 # Imperva bypass — see resolve_smyths_ip() docstring
 IMPERVA_DNS = os.environ.get("IMPERVA_DNS", "1.1.1.1")
 SMYTHS_FORCE_IP = os.environ.get("SMYTHS_FORCE_IP", "")  # set to a known-good IP to skip resolution
@@ -1044,6 +1054,109 @@ async def check_menkind(state: dict, client: httpx.AsyncClient, context: Browser
     return state
 
 
+# ─── @PBSTUK X/TWITTER MONITOR ────────────────────────────────────────────────
+# Polls a Nitter mirror's RSS feed every INTERVAL_PBSTUK seconds. New tweets
+# (anything with a status ID not previously seen) get fanned out to Telegram.
+# Uses a list of Nitter hosts in priority order; falls through to the next on
+# 4xx/5xx. No proxy — Nitter is public and not geo-blocked.
+
+import xml.etree.ElementTree as _ET
+from html import unescape as _html_unescape
+
+_PBSTUK_LINK_RE = re.compile(r"/status/(\d+)")
+_PBSTUK_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _pbstuk_clean(text: str) -> str:
+    """Strip Nitter's HTML wrap + collapse whitespace. Leaves the user-typed tweet text."""
+    s = _PBSTUK_TAG_RE.sub(" ", text or "")
+    s = _html_unescape(s)
+    return " ".join(s.split()).strip()
+
+
+async def _pbstuk_fetch(client: httpx.AsyncClient) -> list[dict] | None:
+    """Try each Nitter host in turn until one returns a usable RSS feed.
+    Returns list of {id, link, pubDate, text} ordered newest-first, or None on total failure."""
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
+    for host in PBSTUK_NITTER_HOSTS:
+        url = f"https://{host}/{PBSTUK_HANDLE}/rss"
+        try:
+            r = await client.get(url, headers=headers, timeout=15, follow_redirects=True)
+        except Exception as exc:
+            log.info("PBSTUK: %s unreachable (%s)", host, exc)
+            continue
+        if r.status_code != 200 or "xml" not in (r.headers.get("content-type") or "").lower():
+            log.info("PBSTUK: %s returned %s ct=%s", host, r.status_code, r.headers.get("content-type"))
+            continue
+        try:
+            root = _ET.fromstring(r.text)
+        except Exception as exc:
+            log.warning("PBSTUK: %s gave non-XML body: %s", host, exc)
+            continue
+        items: list[dict] = []
+        for it in root.findall(".//item"):
+            link = (it.findtext("link") or "").strip()
+            m = _PBSTUK_LINK_RE.search(link)
+            if not m:
+                continue
+            items.append({
+                "id": m.group(1),
+                "link": link.split("#")[0].replace(f"https://{host}/", "https://x.com/"),
+                "pubDate": (it.findtext("pubDate") or "").strip(),
+                "text": _pbstuk_clean(it.findtext("description") or it.findtext("title") or ""),
+            })
+        if items:
+            log.info("PBSTUK: %d tweets from %s", len(items), host)
+            return items
+    return None
+
+
+async def check_pbstuk(state: dict, client: httpx.AsyncClient) -> dict:
+    """Fan new @PBSTUK tweets to Telegram. Dedup by stable tweet ID stored in state."""
+    if "pbstuk" in DISABLED:
+        return state
+    items = await _pbstuk_fetch(client)
+    if not items:
+        log.warning("PBSTUK: no Nitter host returned a usable feed this round")
+        return state
+
+    seen = set(state.get("pbstuk_seen", []))
+    first_run = not seen
+
+    if first_run:
+        # Don't blast 20 historical tweets on first start — just baseline the IDs.
+        seen.update(it["id"] for it in items)
+        latest = items[0]
+        await send_telegram(
+            f"🐦 <b>@{PBSTUK_HANDLE} watcher armed</b>\n\n"
+            f"Baselined {len(items)} recent tweets. New tweets from here on will alert.\n\n"
+            f"Latest:\n<i>{latest['text'][:300]}</i>\n<a href=\"{latest['link']}\">view</a>",
+            client,
+        )
+    else:
+        new_items = [it for it in items if it["id"] not in seen]
+        # Oldest first so the chat reads naturally
+        new_items.reverse()
+        for it in new_items:
+            text = it["text"][:1500] or "(no text)"
+            await send_telegram(
+                f"🐦 <b>@{PBSTUK_HANDLE}</b> · <i>{it['pubDate']}</i>\n\n"
+                f"{text}\n\n<a href=\"{it['link']}\">view tweet</a>",
+                client,
+            )
+            seen.add(it["id"])
+        if not new_items:
+            log.info("PBSTUK: no new tweets")
+
+    # Trim seen-set so state doesn't grow unbounded (keep ~500 newest IDs)
+    state["pbstuk_seen"] = sorted(seen, reverse=True)[:500]
+    return state
+
+
 # ─── MONITOR LOOP ─────────────────────────────────────────────────────────────
 
 BROWSER_REFRESH = 3_600  # rotate context hourly
@@ -1058,11 +1171,12 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
     state["very"] = {}
 
     CHECK_STATUS: dict[str, dict] = {
-        "smyths":     {"label": "🧸 Smyths",     "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
-        "argos":      {"label": "🛍️ Argos",      "ok": None, "time": "", "interval": INTERVAL_ARGOS},
-        "menkind":    {"label": "🎁 Menkind",    "ok": None, "time": "", "interval": INTERVAL_MENKIND},
-        "john_lewis": {"label": "🛒 John Lewis", "ok": None, "time": "", "interval": INTERVAL_JOHN_LEWIS},
-        "very":       {"label": "🟣 Very",       "ok": None, "time": "", "interval": INTERVAL_VERY},
+        "smyths":     {"label": "🧸 Smyths",       "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
+        "argos":      {"label": "🛍️ Argos",        "ok": None, "time": "", "interval": INTERVAL_ARGOS},
+        "menkind":    {"label": "🎁 Menkind",      "ok": None, "time": "", "interval": INTERVAL_MENKIND},
+        "john_lewis": {"label": "🛒 John Lewis",   "ok": None, "time": "", "interval": INTERVAL_JOHN_LEWIS},
+        "very":       {"label": "🟣 Very",         "ok": None, "time": "", "interval": INTERVAL_VERY},
+        "pbstuk":     {"label": "🐦 @PBSTUK feed", "ok": None, "time": "", "interval": INTERVAL_PBSTUK},
     }
     status_msg_id: int | None = state.get("status_msg_id")
 
@@ -1108,7 +1222,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
         FAIL_COUNTS[site] = 0
         FAIL_ALERTED[site] = False
 
-    last = {"smyths": 0.0, "argos": 0.0, "menkind": 0.0, "john_lewis": 0.0, "very": 0.0, "rotate": 0.0}
+    last = {"smyths": 0.0, "argos": 0.0, "menkind": 0.0, "john_lewis": 0.0, "very": 0.0, "pbstuk": 0.0, "rotate": 0.0}
 
     context = await make_context(browser)
     smyths_context = await make_context(smyths_browser) if smyths_browser else context
@@ -1175,6 +1289,19 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
                 last["argos"] = now
                 await _push_status()
                 await asyncio.sleep(random.uniform(1, 3))
+
+            # ── @PBSTUK Twitter watcher (HTTP, no proxy, fast cadence) ─
+            if "pbstuk" not in DISABLED and now - last["pbstuk"] >= INTERVAL_PBSTUK:
+                try:
+                    state = await check_pbstuk(state, client)
+                    _mark("pbstuk", True)
+                    _track_success("pbstuk")
+                except Exception as exc:
+                    log.error("PBSTUK loop error: %s", exc)
+                    _mark("pbstuk", False)
+                    await _track_failure("pbstuk", str(exc))
+                save_state(state)
+                last["pbstuk"] = now
 
             # ── Very (HTTP only — no browser) ─────────────────────────
             if "very" not in DISABLED and now - last["very"] >= INTERVAL_VERY:
@@ -1277,7 +1404,8 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
             f"🛍️ Argos every {INTERVAL_ARGOS // 60} min\n"
             f"🎁 Menkind every {INTERVAL_MENKIND // 60} min\n"
             f"🛒 John Lewis every {INTERVAL_JOHN_LEWIS // 60} min\n"
-            f"🟣 Very every {INTERVAL_VERY // 60} min",
+            f"🟣 Very every {INTERVAL_VERY // 60} min\n"
+            f"🐦 @{PBSTUK_HANDLE} every {INTERVAL_PBSTUK}s",
             client,
         )
 
