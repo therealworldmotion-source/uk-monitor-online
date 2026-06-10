@@ -52,7 +52,14 @@ SMYTHS_PRODUCT_URLS = [
 STORE_POSTCODE = os.environ.get("STORE_POSTCODE", "SL2 1EX")
 STORE_LAT = os.environ.get("STORE_LAT", "51.510665")
 STORE_LNG = os.environ.get("STORE_LNG", "-0.59888")
-STORE_NAME_SMYTHS = os.environ.get("STORE_NAME_SMYTHS", "slough")  # case-insensitive match
+# Stores to watch — case-insensitive substring match against the store-pickup API's
+# store names (one geo-search from the Slough coords returns all of these; they're
+# within ~10 miles). Comma-separated, e.g. "slough,staines,uxbridge".
+STORE_NAMES_SMYTHS = [
+    s.strip().lower()
+    for s in os.environ.get("STORE_NAMES_SMYTHS", "slough,staines,uxbridge").split(",")
+    if s.strip()
+]
 
 # Menkind category URL — Pokemon TCG search results.
 MENKIND_URL = os.environ.get(
@@ -386,7 +393,7 @@ async def _smyths_api_call(page, path: str) -> dict | None:
 
 
 async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
-    """Fetch Slough store + online stock for each configured Smyths product.
+    """Fetch store stock (Slough/Staines/Uxbridge) + online stock for each configured Smyths product.
 
     Bandwidth-optimised: loads ONE Smyths page per cycle to warm Imperva sensor
     cookies, then calls the internal API for every product from that single page
@@ -444,28 +451,43 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
                     title = t
 
             stores = store_data.get("stores", []) or []
-            slough = next((s for s in stores if s.get("name", "").lower() == STORE_NAME_SMYTHS.lower()), None)
-            store_status = (slough.get("stockLevelStatusCode") or slough.get("stockStatusMessage") or "UNKNOWN") if slough else "NO_STORE"
+
+            def _find_store(wanted: str) -> dict | None:
+                return next((s for s in stores if wanted in (s.get("name", "") or "").lower()), None)
+
+            store_statuses: dict[str, str] = {}
+            for wanted in STORE_NAMES_SMYTHS:
+                st = _find_store(wanted)
+                store_statuses[wanted] = (
+                    (st.get("stockLevelStatusCode") or st.get("stockStatusMessage") or "UNKNOWN")
+                    if st else "NO_STORE"
+                )
 
             hd = (inv_data or {}).get("hdSection", {}) if isinstance(inv_data, dict) else {}
             online_status = hd.get("stockLevelStatus") or hd.get("stockLevel") or "UNKNOWN"
             expected_date = hd.get("expectedStockDate", "")
 
             prev = smyths_state.get(pid, {})
-            prev_store = prev.get("store_status", "OUTOFSTOCK")
+            # Migrate pre-multi-store state: old schema had a single "store_status" (Slough).
+            prev_statuses: dict[str, str] = prev.get("store_statuses") or (
+                {"slough": prev["store_status"]} if prev.get("store_status") else {}
+            )
             prev_online = prev.get("online_status", "OUTOFSTOCK")
             prev_expected = prev.get("expected", "")
 
-            log.info("Smyths %s [%s]: store=%s online=%s exp=%s",
-                     pid, title[:40], store_status, online_status, expected_date)
+            log.info("Smyths %s [%s]: stores=%s online=%s exp=%s",
+                     pid, title[:40], store_statuses, online_status, expected_date)
 
-            if store_status not in ("OUTOFSTOCK", "NO_STORE", "UNKNOWN") and prev_store in ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN"):
-                await send_telegram(
-                    f"🚨 <b>SMYTHS SLOUGH — IN STOCK</b>\n\n{title}\nStore: <b>{store_status}</b>\n<a href=\"{url}\">Buy now →</a>",
-                    client,
-                )
-            elif store_status == "OUTOFSTOCK" and prev_store not in ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN"):
-                await send_telegram(f"ℹ️ Smyths Slough: <i>{title}</i> back out of stock.", client)
+            OOS_LIKE = ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN")
+            for wanted, store_status in store_statuses.items():
+                prev_store = prev_statuses.get(wanted, "OUTOFSTOCK")
+                if store_status not in OOS_LIKE and prev_store in OOS_LIKE:
+                    await send_telegram(
+                        f"🚨 <b>SMYTHS {wanted.upper()} — IN STOCK</b>\n\n{title}\nStore: <b>{store_status}</b>\n<a href=\"{url}\">Buy now →</a>",
+                        client,
+                    )
+                elif store_status == "OUTOFSTOCK" and prev_store not in OOS_LIKE:
+                    await send_telegram(f"ℹ️ Smyths {wanted.title()}: <i>{title}</i> back out of stock.", client)
 
             online_in = isinstance(online_status, str) and online_status.upper() not in ("OUTOFSTOCK", "UNKNOWN", "")
             prev_online_in = isinstance(prev_online, str) and prev_online.upper() not in ("OUTOFSTOCK", "UNKNOWN", "")
@@ -486,7 +508,7 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
             smyths_state[pid] = {
                 "title": title,
                 "url": url,
-                "store_status": store_status,
+                "store_statuses": store_statuses,
                 "online_status": online_status,
                 "expected": expected_date,
             }
