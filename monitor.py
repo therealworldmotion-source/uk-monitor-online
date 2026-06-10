@@ -3,9 +3,8 @@
 UK Pokemon TCG Retailer Monitor — Railway edition
 ─────────────────────────────────────────────────
 Tracks:
-  • Smyths Toys  (per-product, Slough store-stock + online)
-  • Menkind      (whole Pokemon TCG category, in-stock alerts)
-  • @PBSTUK on X (real-time tweet alerts via Nitter RSS — restock news)
+  • Smyths Toys  (per-product, Slough/Staines/Uxbridge store-stock + online)
+  • @PBSTUK on X (real-time tweet alerts via Twitter API v2 — restock news)
 
 Designed for a single Railway container. State persists to DATA_DIR (mount a 1 GB volume at /data).
 All config via env vars — see README.md.
@@ -25,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from bs4 import BeautifulSoup
 from patchright.async_api import BrowserContext, async_playwright
 
 try:
@@ -61,15 +59,8 @@ STORE_NAMES_SMYTHS = [
     if s.strip()
 ]
 
-# Menkind category URL — Pokemon TCG search results.
-MENKIND_URL = os.environ.get(
-    "MENKIND_URL",
-    "https://www.menkind.co.uk/search.php?BigCommerceX%5Bquery%5D=pokemon+TCG",
-)
-
 # Check intervals (seconds).
-INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "120"))
-INTERVAL_MENKIND = int(os.environ.get("INTERVAL_MENKIND", "120"))
+INTERVAL_SMYTHS = int(os.environ.get("INTERVAL_SMYTHS", "30"))
 
 # X / Twitter monitoring — @PBSTUK (Pokemon UK PBST restock alerts)
 PBSTUK_HANDLE = os.environ.get("PBSTUK_HANDLE", "PBSTUK")
@@ -133,7 +124,7 @@ def load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             log.warning("State file corrupt, starting fresh")
-    return {"smyths": {}, "menkind": {}}
+    return {"smyths": {}}
 
 
 def save_state(state: dict) -> None:
@@ -256,10 +247,6 @@ async def run_watchdog(monitor_task: asyncio.Task, client: httpx.AsyncClient) ->
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-def product_key(s: str) -> str:
-    return s.lower().strip().replace(" ", "-").replace("/", "-")[:80]
-
-
 def smyths_id_from_url(url: str) -> str | None:
     m = re.search(r"/p/(\d+)", url)
     return m.group(1) if m else None
@@ -367,82 +354,89 @@ async def launch_chromium(pw, host_resolver_rules: str | None = None):
 
 
 # ─── SMYTHS ───────────────────────────────────────────────────────────────────
+# The store-pickup / inventory APIs are Imperva-challenged: a plain fetch() gets the
+# challenge HTML back as inert text and 403s forever. Navigating the TAB to the API
+# URL instead lets the challenge script execute, earn the sensor cookie, and reload
+# into the real JSON — and once the cookie exists, subsequent navs are direct JSON.
+# A persistent page keeps those cookies alive across 30s cycles.
 
-_SMYTHS_FETCH_JS = """
-async ({path}) => {
-    try {
-        const r = await fetch(path, { headers: { 'Accept': 'application/json' }, credentials: 'include' });
-        if (r.status !== 200) return { __err: r.status };
-        return await r.json();
-    } catch (e) {
-        return { __err: 'fetch:' + (e && e.message || e) };
-    }
-}
-"""
+_SMYTHS_PAGE: dict[str, Any] = {"page": None}
 
-async def _smyths_api_call(page, path: str) -> dict | None:
-    """Call a Smyths internal API from inside the page. Returns parsed JSON, or None on failure."""
-    try:
-        result = await page.evaluate(_SMYTHS_FETCH_JS, {"path": path})
-    except Exception as exc:
-        log.warning("Smyths API eval failed for %s: %s", path, exc)
-        return None
-    if isinstance(result, dict) and "__err" in result:
-        return None
-    return result
+
+async def _get_smyths_page(context: BrowserContext):
+    page = _SMYTHS_PAGE.get("page")
+    if page is not None:
+        try:
+            if not page.is_closed():
+                return page
+        except Exception:
+            pass
+    page = await context.new_page()
+    _SMYTHS_PAGE["page"] = page
+    return page
+
+
+async def _smyths_nav_json(page, url: str, challenge_wait: int = 20) -> dict | None:
+    """Navigate to an API URL and parse the JSON body, riding out an Imperva challenge.
+    Tries twice: challenge pages usually auto-reload into the JSON; if this one doesn't,
+    the cookie it earned makes the second goto return JSON directly."""
+    for attempt in (1, 2):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as exc:
+            log.warning("Smyths nav failed: %s", str(exc)[:120])
+            return None
+        for _ in range(challenge_wait if attempt == 1 else 8):
+            try:
+                body = (await page.evaluate("() => document.body ? document.body.innerText : ''") or "").strip()
+            except Exception:
+                body = ""  # mid-reload — try again next second
+            if body.startswith("{") or body.startswith("["):
+                try:
+                    return json.loads(body)
+                except Exception:
+                    pass
+            await page.wait_for_timeout(1_000)
+    return None
 
 
 async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
     """Fetch store stock (Slough/Staines/Uxbridge) + online stock for each configured Smyths product.
 
-    Bandwidth-optimised: loads ONE Smyths page per cycle to warm Imperva sensor
-    cookies, then calls the internal API for every product from that single page
-    via `fetch()` — saves ~5× browser navigations vs hitting each product page.
-    Resource blocking (images/CSS/fonts/media) further trims the warm-up page itself."""
+    Bandwidth-optimised for a 30s cadence: a persistent page navigates straight to the
+    JSON APIs (~2 KB each) — no product-page loads at all. The first cycle pays the
+    Imperva challenge once; the sensor cookie then lives in the page's context."""
     if "smyths" in DISABLED:
         return state
     if not SMYTHS_PRODUCT_URLS:
         log.info("Smyths: no products configured (SMYTHS_PRODUCT_URLS empty)")
         return state
 
-    log.info("Checking Smyths (%d products)...", len(SMYTHS_PRODUCT_URLS))
     smyths_state: dict[str, dict] = state.setdefault("smyths", {})
+    page = await _get_smyths_page(context)
+    ok_count = 0
 
-    page = await context.new_page()
     try:
-        try:
-            await page.goto(SMYTHS_PRODUCT_URLS[0], wait_until="domcontentloaded", timeout=35_000)
-            await page.wait_for_timeout(12_000)  # let Imperva sensor cookies settle
-        except Exception as exc:
-            log.error("Smyths warm-up failed: %s — skipping cycle", exc)
-            return state
-
         for url in SMYTHS_PRODUCT_URLS:
             pid = smyths_id_from_url(url)
             if not pid:
                 log.warning("Smyths: cannot extract id from %s", url)
                 continue
 
-            store_path = (
-                f"/api/uk/en-gb/store-pickup/pointOfServices?productId={pid}"
+            store_url = (
+                f"https://www.smythstoys.com/api/uk/en-gb/store-pickup/pointOfServices?productId={pid}"
                 f"&selectedStore=Northampton&latitude={STORE_LAT}&longitude={STORE_LNG}"
                 f"&searchThroughGeoPointFirst=true&cartPage=false"
             )
-            inv_path = f"/api/uk/en-gb/product/product-inventory?code={pid}&userId=anonymous&bundle=false"
+            inv_url = f"https://www.smythstoys.com/api/uk/en-gb/product/product-inventory?code={pid}&userId=anonymous&bundle=false"
 
-            try:
-                store_data = await _smyths_api_call(page, store_path)
-                if store_data is None:
-                    await page.wait_for_timeout(3_000)
-                    store_data = await _smyths_api_call(page, store_path)
-                inv_data = await _smyths_api_call(page, inv_path)
-            except Exception as exc:
-                log.warning("Smyths %s: API call error: %s", pid, exc)
-                continue
+            store_data = await _smyths_nav_json(page, store_url)
+            inv_data = await _smyths_nav_json(page, inv_url, challenge_wait=8)
 
             if not store_data:
-                log.warning("Smyths %s: store-pickup API blocked (Imperva 403) — skipping", pid)
+                log.warning("Smyths %s: store API still challenged — skipping", pid)
                 continue
+            ok_count += 1
 
             title = smyths_state.get(pid, {}).get("title") or f"Smyths #{pid}"
             if isinstance(inv_data, dict):
@@ -475,8 +469,9 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
             prev_online = prev.get("online_status", "OUTOFSTOCK")
             prev_expected = prev.get("expected", "")
 
-            log.info("Smyths %s [%s]: stores=%s online=%s exp=%s",
-                     pid, title[:40], store_statuses, online_status, expected_date)
+            if not prev or store_statuses != prev_statuses or online_status != prev_online or expected_date != prev_expected:
+                log.info("Smyths %s [%s]: stores=%s online=%s exp=%s",
+                         pid, title[:40], store_statuses, online_status, expected_date)
 
             OOS_LIKE = ("OUTOFSTOCK", "", "NO_STORE", "UNKNOWN")
             for wanted, store_status in store_statuses.items():
@@ -512,120 +507,18 @@ async def check_smyths(state: dict, client: httpx.AsyncClient, context: BrowserC
                 "online_status": online_status,
                 "expected": expected_date,
             }
-    finally:
+    except Exception:
+        # A dead page would poison every future cycle — drop it so the next cycle
+        # opens a fresh one (and re-pays the Imperva challenge once).
         try:
             await page.close()
         except Exception:
             pass
+        _SMYTHS_PAGE["page"] = None
+        raise
 
+    log.info("Smyths cycle: %d/%d products OK", ok_count, len(SMYTHS_PRODUCT_URLS))
     state["smyths"] = smyths_state
-    return state
-
-
-# ─── MENKIND ──────────────────────────────────────────────────────────────────
-
-def _fmt_menkind(prod: dict, icon: str = "") -> str:
-    # Menkind is on BigCommerce, but its legacy cart.php permalinks are disabled —
-    # any cart-add URL just redirects to the homepage. So we only ever link to the product page.
-    icon = icon or ("✅" if prod.get("available") else "❌")
-    price = prod.get("price", "")
-    price_str = f" — {price}" if price and price != "N/A" else ""
-    title = prod.get("title", "Unknown")
-    url = prod.get("url", "")
-    return f"  {icon} <a href=\"{url}\">{title}</a>{price_str}"
-
-
-async def check_menkind(state: dict, client: httpx.AsyncClient, context: BrowserContext) -> dict:
-    if "menkind" in DISABLED:
-        return state
-
-    log.info("Checking Menkind...")
-    page = None
-    try:
-        await asyncio.sleep(random.uniform(1, 3))
-        page = await context.new_page()
-        await page.goto(MENKIND_URL, wait_until="domcontentloaded", timeout=35_000)
-        try:
-            await page.wait_for_selector("article.product-card", timeout=15_000)
-        except Exception:
-            log.warning("Menkind: timed out waiting for product cards")
-        await asyncio.sleep(random.uniform(1, 2))
-
-        html = await page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        current: dict[str, dict] = {}
-
-        for item in soup.select("article.product-card"):
-            title_el = item.select_one("h1.product-card__title, .product-card__title-container")
-            if not title_el:
-                continue
-            title = title_el.get_text(strip=True)
-            if not title or len(title) < 3:
-                continue
-
-            link_el = item.select_one("a.product-card__link, a[href*='/']")
-            href = link_el.get("href", "") if link_el else ""
-            url = href if href.startswith("http") else f"https://www.menkind.co.uk{href}"
-            url = url.split("?")[0]
-
-            price_el = item.select_one(".product-card__price")
-            price = price_el.get_text(strip=True) if price_el else "N/A"
-
-            oos_el = item.select_one("[class*='sold-out'], [class*='out-of-stock'], [class*='unavailable']")
-            available = not oos_el
-
-            # Dedup by stable BigCommerce product id (data-entity-id), not parsed title
-            pid = item.get("data-entity-id") or item.get("data-product-id") or ""
-            key = pid or product_key(title)
-            current[key] = {
-                "title": title,
-                "url": url,
-                "price": price,
-                "available": available,
-                "product_id": pid,
-            }
-
-        if not current:
-            log.warning("Menkind: no products found — selectors may need updating")
-            return state
-
-        prev = state.get("menkind", {})
-        # Algolia search ranking can rotate cards — track every pid ever seen and only fire 'new' once.
-        seen_ever = set(state.get("menkind_seen", []))
-        first_run = len(prev) == 0 and not seen_ever
-
-        if first_run:
-            lines = [f"<b>🎁 MENKIND — Monitoring Started</b>",
-                     f"<i>{len(current)} Pokemon TCG-related products tracked</i>",
-                     "\n✅ <b>In Stock:</b>"]
-            for p in list(current.values())[:25]:
-                lines.append(_fmt_menkind(p))
-            if len(current) > 25:
-                lines.append(f"  …and {len(current) - 25} more")
-            await send_telegram("\n".join(lines), client)
-        else:
-            new_p = [prod for pid, prod in current.items() if pid not in seen_ever]
-            if new_p:
-                lines = [f"<b>🆕 MENKIND — {len(new_p)} New Product(s)</b>"]
-                for p in new_p:
-                    lines.append(_fmt_menkind(p))
-                await send_telegram("\n".join(lines), client)
-            else:
-                log.info("Menkind: no changes")
-
-        seen_ever.update(current.keys())
-        state["menkind"] = current
-        state["menkind_seen"] = sorted(seen_ever)
-
-    except Exception as exc:
-        log.error("Menkind check failed: %s", exc)
-    finally:
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                pass
-
     return state
 
 
@@ -725,18 +618,17 @@ async def check_pbstuk(state: dict, client: httpx.AsyncClient) -> dict:
 
 BROWSER_REFRESH = 3_600  # rotate context hourly
 
-async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> None:
+async def monitor_loop(client: httpx.AsyncClient, browser) -> None:
     state = load_state()
-
-    # Re-baseline whole-category retailers on each start so user gets a fresh in-stock list
-    state["menkind"] = {}
 
     CHECK_STATUS: dict[str, dict] = {
         "smyths":  {"label": "🧸 Smyths",       "ok": None, "time": "", "interval": INTERVAL_SMYTHS},
-        "menkind": {"label": "🎁 Menkind",      "ok": None, "time": "", "interval": INTERVAL_MENKIND},
         "pbstuk":  {"label": "🐦 @PBSTUK feed", "ok": None, "time": "", "interval": INTERVAL_PBSTUK},
     }
     status_msg_id: int | None = state.get("status_msg_id")
+
+    def _fmt_interval(sec: int) -> str:
+        return f"{sec}s" if sec < 60 else f"{max(1, sec // 60)} min"
 
     def _fmt_status() -> str:
         lines = ["<b>📊 UK Monitor Status</b>"]
@@ -745,8 +637,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
                 continue
             icon = "✅" if v["ok"] is True else ("❌" if v["ok"] is False else "⏳")
             t = f" <i>({v['time']})</i>" if v["time"] else ""
-            interval_min = max(1, v["interval"] // 60)
-            lines.append(f"{icon} {v['label']} — every {interval_min} min{t}")
+            lines.append(f"{icon} {v['label']} — every {_fmt_interval(v['interval'])}{t}")
         return "\n".join(lines)
 
     async def _push_status() -> None:
@@ -780,10 +671,9 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
         FAIL_COUNTS[site] = 0
         FAIL_ALERTED[site] = False
 
-    last = {"smyths": 0.0, "menkind": 0.0, "pbstuk": 0.0, "rotate": 0.0}
+    last = {"smyths": 0.0, "pbstuk": 0.0, "rotate": 0.0}
 
     context = await make_context(browser)
-    smyths_context = await make_context(smyths_browser) if smyths_browser else context
 
     await _push_status()
 
@@ -793,22 +683,20 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
             HEARTBEAT["last"] = now
 
             if now - last["rotate"] >= BROWSER_REFRESH:
-                for c in (context, smyths_context if smyths_browser else None):
-                    if c is None:
-                        continue
-                    try:
-                        await c.close()
-                    except Exception:
-                        pass
+                try:
+                    await context.close()
+                except Exception:
+                    pass
                 context = await make_context(browser)
-                smyths_context = await make_context(smyths_browser) if smyths_browser else context
+                # Persistent Smyths page died with the old context; next cycle recreates it.
+                _SMYTHS_PAGE["page"] = None
                 last["rotate"] = now
-                log.info("Browser contexts rotated")
+                log.info("Browser context rotated")
 
-            # ── Smyths ────────────────────────────────────────────────
+            # ── Smyths (persistent page, 30s cadence) ─────────────────
             if "smyths" not in DISABLED and SMYTHS_PRODUCT_URLS and now - last["smyths"] >= INTERVAL_SMYTHS:
                 try:
-                    state = await check_smyths(state, client, smyths_context)
+                    state = await check_smyths(state, client, context)
                     _mark("smyths", True)
                     _track_success("smyths")
                 except Exception as exc:
@@ -818,14 +706,14 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
                     # If browser context died, recreate for next round
                     if "Connection closed" in str(exc) or "Target page" in str(exc):
                         try:
-                            await smyths_context.close()
+                            await context.close()
                         except Exception:
                             pass
-                        smyths_context = await make_context(smyths_browser) if smyths_browser else await make_context(browser)
+                        context = await make_context(browser)
+                        _SMYTHS_PAGE["page"] = None
                 save_state(state)
                 last["smyths"] = now
                 await _push_status()
-                await asyncio.sleep(random.uniform(1, 3))
 
             # ── @PBSTUK Twitter watcher (HTTP, no proxy, fast cadence) ─
             if "pbstuk" not in DISABLED and now - last["pbstuk"] >= INTERVAL_PBSTUK:
@@ -840,39 +728,15 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
                 save_state(state)
                 last["pbstuk"] = now
 
-            # ── Menkind ───────────────────────────────────────────────
-            if "menkind" not in DISABLED and now - last["menkind"] >= INTERVAL_MENKIND:
-                try:
-                    state = await check_menkind(state, client, context)
-                    _mark("menkind", bool(state.get("menkind")))
-                    _track_success("menkind")
-                except Exception as exc:
-                    log.error("Menkind loop error: %s", exc)
-                    _mark("menkind", False)
-                    await _track_failure("menkind", str(exc))
-                    if "Connection closed" in str(exc) or "Target page" in str(exc):
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
-                        context = await make_context(browser)
-                save_state(state)
-                last["menkind"] = now
-                await _push_status()
-                await asyncio.sleep(random.uniform(1, 3))
-
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
     except asyncio.CancelledError:
         log.info("Monitor loop cancelled")
     finally:
-        for c in (context, smyths_context if smyths_browser else None):
-            if c is None:
-                continue
-            try:
-                await c.close()
-            except Exception:
-                pass
+        try:
+            await context.close()
+        except Exception:
+            pass
 
 
 # ─── TELEGRAM LISTENER ────────────────────────────────────────────────────────
@@ -880,7 +744,7 @@ async def monitor_loop(client: httpx.AsyncClient, browser, smyths_browser) -> No
 AUTOSTART = os.environ.get("AUTOSTART", "true").lower() == "true"
 
 
-async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) -> None:
+async def telegram_listener(client: httpx.AsyncClient, browser) -> None:
     monitor_task: asyncio.Task | None = None
     watchdog_task: asyncio.Task | None = None
 
@@ -891,8 +755,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
 
     await send_telegram(
         "🤖 <b>UK Pokemon TCG Monitor online.</b>\n\n"
-        f"Tracking: Smyths ({len(SMYTHS_PRODUCT_URLS)}) · Menkind · @{PBSTUK_HANDLE}\n"
-        f"Slough postcode: <code>{STORE_POSTCODE}</code>\n\n"
+        f"Tracking: Smyths ({len(SMYTHS_PRODUCT_URLS)} products, Slough/Staines/Uxbridge) · @{PBSTUK_HANDLE}\n\n"
         "Send <code>start</code> to begin, <code>stop</code> to pause, <code>status</code> for state.",
         client,
     )
@@ -903,12 +766,11 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
             await send_telegram("⚠️ Already running.", client)
             return
         HEARTBEAT["last"] = 0.0
-        monitor_task = asyncio.create_task(monitor_loop(client, browser, smyths_browser))
+        monitor_task = asyncio.create_task(monitor_loop(client, browser))
         watchdog_task = asyncio.create_task(run_watchdog(monitor_task, client))
         await send_telegram(
             "✅ <b>Monitor started</b>\n\n"
-            f"🧸 Smyths every {INTERVAL_SMYTHS // 60} min\n"
-            f"🎁 Menkind every {INTERVAL_MENKIND // 60} min\n"
+            f"🧸 Smyths every {INTERVAL_SMYTHS}s (Slough · Staines · Uxbridge + online)\n"
             f"🐦 @{PBSTUK_HANDLE} every {INTERVAL_PBSTUK}s",
             client,
         )
@@ -957,7 +819,7 @@ async def telegram_listener(client: httpx.AsyncClient, browser, smyths_browser) 
 async def main() -> None:
     log.info("=" * 60)
     log.info("UK Pokemon TCG Monitor — starting")
-    log.info("Smyths products: %d  Menkind: category-scrape  PBSTUK: every %ds", len(SMYTHS_PRODUCT_URLS), INTERVAL_PBSTUK)
+    log.info("Smyths products: %d every %ds  PBSTUK: every %ds", len(SMYTHS_PRODUCT_URLS), INTERVAL_SMYTHS, INTERVAL_PBSTUK)
     log.info("Postcode: %s   Disabled: %s", STORE_POSTCODE, sorted(DISABLED) or "none")
     log.info("Telegram: %s", "ENABLED" if TELEGRAM_ENABLED else "DISABLED (will log to stdout)")
     log.info("=" * 60)
@@ -977,20 +839,16 @@ async def main() -> None:
 
     async with httpx.AsyncClient(timeout=35, follow_redirects=True) as client:
         async with async_playwright() as pw:
-            browser = await launch_chromium(pw)
-            smyths_browser = await launch_chromium(pw, host_resolver_rules) if host_resolver_rules else None
+            browser = await launch_chromium(pw, host_resolver_rules)
             try:
-                await telegram_listener(client, browser, smyths_browser)
+                await telegram_listener(client, browser)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 log.info("Shutting down")
             finally:
-                for b in (browser, smyths_browser):
-                    if b is None:
-                        continue
-                    try:
-                        await b.close()
-                    except Exception:
-                        pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
