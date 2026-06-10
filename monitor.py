@@ -372,6 +372,21 @@ async def _get_smyths_page(context: BrowserContext):
         except Exception:
             pass
     page = await context.new_page()
+    # Warm-up: load one real product page so the Imperva sensor runs in a full HTML
+    # context and earns the domain-wide cookie (product pages load fine from Railway;
+    # it's only the API endpoints that get challenged cold). Light interaction helps
+    # the sensor score us as human.
+    try:
+        await page.goto(SMYTHS_PRODUCT_URLS[0], wait_until="domcontentloaded", timeout=35_000)
+        await page.mouse.move(640, 300)
+        await page.mouse.wheel(0, 600)
+        await page.wait_for_timeout(15_000)
+        await page.mouse.wheel(0, -200)
+        cookies = await context.cookies("https://www.smythstoys.com")
+        names = sorted(c["name"] for c in cookies)
+        log.info("Smyths warm-up done — %d cookies: %s", len(names), ",".join(names)[:200])
+    except Exception as exc:
+        log.warning("Smyths warm-up failed: %s", str(exc)[:120])
     _SMYTHS_PAGE["page"] = page
     return page
 
@@ -397,6 +412,12 @@ async def _smyths_nav_json(page, url: str, challenge_wait: int = 20) -> dict | N
                 except Exception:
                     pass
             await page.wait_for_timeout(1_000)
+    # Both attempts exhausted — log what Imperva actually served so we can diagnose.
+    try:
+        html = (await page.content())[:160].replace("\n", " ")
+    except Exception:
+        html = "<unreadable>"
+    log.warning("Smyths challenge body: %s", html)
     return None
 
 
