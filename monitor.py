@@ -335,9 +335,24 @@ async def telegram_listener(client: httpx.AsyncClient) -> None:
                     f"🐦 @{PBSTUK_HANDLE} every {INTERVAL_PBSTUK}s",
                     client,
                 )
+            elif text == "test":
+                # On-demand pipeline check — pulls the latest tweet regardless of since_id
+                # so you can confirm fetch → Telegram works even when the account is quiet.
+                items = await _pbstuk_fetch(client)
+                if not items:
+                    await send_telegram("⚠️ Test: couldn't fetch any tweets (API issue?).", client)
+                else:
+                    it = items[0]
+                    await send_telegram(
+                        f"🧪 <b>TEST — latest @{PBSTUK_HANDLE} tweet</b>\n"
+                        f"<i>{it['pubDate']}</i>\n\n{it['text'][:1500]}\n\n"
+                        f"<a href=\"{it['link']}\">view tweet</a>\n\n"
+                        f"✅ Pipeline working — real new tweets will arrive like this within {INTERVAL_PBSTUK}s.",
+                        client,
+                    )
             else:
                 await send_telegram(
-                    "Commands:\n  <code>start</code>\n  <code>stop</code>\n  <code>status</code>",
+                    "Commands:\n  <code>start</code>\n  <code>stop</code>\n  <code>status</code>\n  <code>test</code> — show latest tweet now",
                     client,
                 )
 
