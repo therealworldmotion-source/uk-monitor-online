@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-@PBSTUK X/Twitter → Telegram bot — Railway edition
-──────────────────────────────────────────────────
-Watches @PBSTUK on X (Twitter API v2) and pushes every new original tweet
-(no replies, no retweets) to Telegram within ~30s. No browser, no proxy.
+X/Twitter → Telegram bot — Railway edition
+───────────────────────────────────────────
+Watches one or more X accounts (Twitter API v2, TWITTER_HANDLES env) and pushes
+every new original tweet (no replies, no retweets) to Telegram within ~30s,
+labelled by account. All handles share ONE combined query. No browser, no proxy.
 
 Designed for a single Railway container. State persists to DATA_DIR
 (mount a small volume at /data). All config via env vars — see README.md.
@@ -30,10 +31,16 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
-# X / Twitter monitoring — @PBSTUK (Pokemon UK PBST restock alerts)
-PBSTUK_HANDLE = os.environ.get("PBSTUK_HANDLE", "PBSTUK")
+# X / Twitter monitoring — comma-separated handles (Pokemon UK restock accounts).
+# All handles are checked in ONE combined query, so adding more doesn't cost extra API calls.
+TWITTER_HANDLES = [
+    h.strip().lstrip("@")
+    for h in os.environ.get("TWITTER_HANDLES", "PBSTUK,dropalertsuk").split(",")
+    if h.strip()
+]
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN", "").strip()
-INTERVAL_PBSTUK = int(os.environ.get("INTERVAL_PBSTUK", "30"))
+# INTERVAL_PBSTUK kept for backward-compat with the existing Railway env var.
+INTERVAL_TWITTER = int(os.environ.get("INTERVAL_TWITTER", os.environ.get("INTERVAL_PBSTUK", "30")))
 
 AUTOSTART = os.environ.get("AUTOSTART", "true").lower() == "true"
 
@@ -158,21 +165,27 @@ async def run_watchdog(monitor_task: asyncio.Task, client: httpx.AsyncClient) ->
             pass
 
 
-# ─── @PBSTUK X/TWITTER MONITOR ────────────────────────────────────────────────
-# Polls Twitter API v2 every INTERVAL_PBSTUK seconds. New tweets get fanned to
-# Telegram. Requires TWITTER_BEARER_TOKEN env var (free dev account, no proxy).
+# ─── X/TWITTER MONITOR ────────────────────────────────────────────────────────
+# Polls Twitter API v2 every INTERVAL_TWITTER seconds across ALL configured handles
+# in one combined query. New tweets get fanned to Telegram, each labelled with its
+# account. Requires TWITTER_BEARER_TOKEN (no proxy, no browser).
 
-async def _pbstuk_fetch(client: httpx.AsyncClient, since_id: str | None = None) -> list[dict] | None:
-    """Fetch @PBSTUK tweets via Twitter API v2.
-    Pass since_id to only fetch tweets newer than that ID (zero usage when nothing new).
-    Returns list of {id, link, pubDate, text} newest-first, [] if none new, None on failure."""
+async def _twitter_fetch(client: httpx.AsyncClient, since_id: str | None = None) -> list[dict] | None:
+    """Fetch new tweets from all TWITTER_HANDLES via one combined API v2 query.
+    Pass since_id to only fetch tweets newer than that ID (zero cost when nothing new).
+    Returns list of {id, handle, link, pubDate, text} newest-first, [] if none, None on failure."""
     if not TWITTER_BEARER_TOKEN:
-        log.warning("PBSTUK: TWITTER_BEARER_TOKEN not set — cannot fetch tweets")
+        log.warning("Twitter: TWITTER_BEARER_TOKEN not set — cannot fetch tweets")
         return None
+    if not TWITTER_HANDLES:
+        return []
+    from_clause = " OR ".join(f"from:{h}" for h in TWITTER_HANDLES)
     params: dict = {
-        "query": f"from:{PBSTUK_HANDLE} -is:retweet -is:reply",
-        "tweet.fields": "created_at,text",
-        "max_results": "10",
+        "query": f"({from_clause}) -is:retweet -is:reply",
+        "tweet.fields": "created_at,author_id",
+        "expansions": "author_id",
+        "user.fields": "username",
+        "max_results": "20",
     }
     if since_id:
         params["since_id"] = since_id
@@ -184,65 +197,68 @@ async def _pbstuk_fetch(client: httpx.AsyncClient, since_id: str | None = None) 
             timeout=15,
         )
     except Exception as exc:
-        log.warning("PBSTUK: Twitter API error: %s", exc)
+        log.warning("Twitter: API error: %s", exc)
         return None
 
     if r.status_code != 200:
-        log.warning("PBSTUK: Twitter API returned %s: %s", r.status_code, r.text[:200])
+        log.warning("Twitter: API returned %s: %s", r.status_code, r.text[:200])
         return None
 
-    tweets = r.json().get("data") or []
-    return [
-        {
+    data = r.json()
+    users = {u["id"]: u["username"] for u in data.get("includes", {}).get("users", [])}
+    tweets = data.get("data") or []
+    out = []
+    for t in tweets:
+        handle = users.get(t.get("author_id"), TWITTER_HANDLES[0])
+        out.append({
             "id": t["id"],
-            "link": f"https://x.com/{PBSTUK_HANDLE}/status/{t['id']}",
+            "handle": handle,
+            "link": f"https://x.com/{handle}/status/{t['id']}",
             "pubDate": t.get("created_at", ""),
             "text": t.get("text", ""),
-        }
-        for t in tweets
-    ]
+        })
+    return out
 
 
-async def check_pbstuk(state: dict, client: httpx.AsyncClient) -> dict:
-    """Fan new @PBSTUK tweets to Telegram. Uses since_id so the API only returns
-    genuinely new tweets — zero usage when @PBSTUK hasn't posted."""
-    newest_id: str | None = state.get("pbstuk_newest_id")
+async def check_twitter(state: dict, client: httpx.AsyncClient) -> dict:
+    """Fan new tweets from all watched accounts to Telegram. Uses since_id so the API
+    only returns genuinely new tweets — zero usage when nobody has posted."""
+    newest_id: str | None = state.get("twitter_newest_id")
 
     if not newest_id:
-        # First ever run — baseline silently so we don't spam old tweets.
-        items = await _pbstuk_fetch(client)  # no since_id: get recent tweets
+        # First run of the multi-account watcher — baseline silently (no spam of old tweets).
+        items = await _twitter_fetch(client)  # no since_id: recent tweets
         if items is None:
             return state
         if items:
-            newest_id = items[0]["id"]  # highest ID = most recent
-            state["pbstuk_newest_id"] = newest_id
-            latest = items[0]
-            await send_telegram(
-                f"🐦 <b>@{PBSTUK_HANDLE} watcher armed</b>\n\n"
-                f"Baselined {len(items)} recent tweets. Will alert on new ones only.\n\n"
-                f"Latest: <i>{latest['text'][:300]}</i>\n<a href=\"{latest['link']}\">view</a>",
-                client,
-            )
+            state["twitter_newest_id"] = items[0]["id"]  # highest ID = most recent
+        handles = ", ".join(f"@{h}" for h in TWITTER_HANDLES)
+        await send_telegram(
+            f"🐦 <b>Watcher armed</b>\n\nWatching: {handles}\n"
+            f"Baselined {len(items)} recent tweets — will alert on new ones only.",
+            client,
+        )
         return state
 
     # Normal run — only fetch tweets newer than the last one we saw.
-    items = await _pbstuk_fetch(client, since_id=newest_id)
+    items = await _twitter_fetch(client, since_id=newest_id)
     if items is None:
         return state  # API error — try again next cycle
     if not items:
-        log.info("PBSTUK: no new tweets")
+        log.info("Twitter: no new tweets")
         return state
 
     # Alert oldest-first so the chat reads in order.
     for it in reversed(items):
         await send_telegram(
-            f"🐦 <b>@{PBSTUK_HANDLE}</b> · <i>{it['pubDate']}</i>\n\n"
+            f"🐦 <b>@{it['handle']}</b> · <i>{it['pubDate']}</i>\n\n"
             f"{it['text'][:1500]}\n\n<a href=\"{it['link']}\">view tweet</a>",
             client,
         )
+    log.info("Twitter: delivered %d new tweet(s)", len(items))
 
     # Store the newest ID seen so next call only gets tweets after this.
-    state["pbstuk_newest_id"] = items[0]["id"]
+    state["twitter_newest_id"] = items[0]["id"]
     return state
 
 
@@ -250,10 +266,11 @@ async def check_pbstuk(state: dict, client: httpx.AsyncClient) -> dict:
 
 async def monitor_loop(client: httpx.AsyncClient) -> None:
     state = load_state()
-    last_pbstuk = 0.0
+    last_check = 0.0
+    handles = ", ".join(f"@{h}" for h in TWITTER_HANDLES)
 
     await send_telegram(
-        f"✅ <b>Monitor started</b>\n\n🐦 Watching @{PBSTUK_HANDLE} every {INTERVAL_PBSTUK}s",
+        f"✅ <b>Monitor started</b>\n\n🐦 Watching {handles} every {INTERVAL_TWITTER}s",
         client,
     )
 
@@ -262,13 +279,13 @@ async def monitor_loop(client: httpx.AsyncClient) -> None:
             now = time.monotonic()
             HEARTBEAT["last"] = now
 
-            if now - last_pbstuk >= INTERVAL_PBSTUK:
+            if now - last_check >= INTERVAL_TWITTER:
                 try:
-                    state = await check_pbstuk(state, client)
+                    state = await check_twitter(state, client)
                 except Exception as exc:
-                    log.error("PBSTUK loop error: %s", exc)
+                    log.error("Twitter loop error: %s", exc)
                 save_state(state)
-                last_pbstuk = now
+                last_check = now
 
             await asyncio.sleep(2)
 
@@ -287,8 +304,9 @@ async def telegram_listener(client: httpx.AsyncClient) -> None:
     offset = (updates[-1]["update_id"] + 1) if updates else 0
     log.info("Telegram listener ready (skipped %d old msg(s))", len(updates))
 
+    handles = ", ".join(f"@{h}" for h in TWITTER_HANDLES)
     await send_telegram(
-        f"🤖 <b>@{PBSTUK_HANDLE} → Telegram bot online.</b>\n\n"
+        f"🤖 <b>X → Telegram bot online.</b>\n\nWatching: {handles}\n\n"
         "Send <code>start</code> to begin, <code>stop</code> to pause, <code>status</code> for state.",
         client,
     )
@@ -330,24 +348,25 @@ async def telegram_listener(client: httpx.AsyncClient) -> None:
                     await send_telegram("🛑 <b>Monitor stopped.</b>", client)
             elif text == "status":
                 running = monitor_task and not monitor_task.done()
+                handles = ", ".join(f"@{h}" for h in TWITTER_HANDLES)
                 await send_telegram(
                     f"<b>Status:</b> {'🟢 Running' if running else '🔴 Stopped'}\n"
-                    f"🐦 @{PBSTUK_HANDLE} every {INTERVAL_PBSTUK}s",
+                    f"🐦 {handles} every {INTERVAL_TWITTER}s",
                     client,
                 )
             elif text == "test":
-                # On-demand pipeline check — pulls the latest tweet regardless of since_id
-                # so you can confirm fetch → Telegram works even when the account is quiet.
-                items = await _pbstuk_fetch(client)
+                # On-demand pipeline check — pulls the latest tweets regardless of since_id
+                # so you can confirm fetch → Telegram works even when the accounts are quiet.
+                items = await _twitter_fetch(client)
                 if not items:
                     await send_telegram("⚠️ Test: couldn't fetch any tweets (API issue?).", client)
                 else:
                     it = items[0]
                     await send_telegram(
-                        f"🧪 <b>TEST — latest @{PBSTUK_HANDLE} tweet</b>\n"
+                        f"🧪 <b>TEST — latest tweet (@{it['handle']})</b>\n"
                         f"<i>{it['pubDate']}</i>\n\n{it['text'][:1500]}\n\n"
                         f"<a href=\"{it['link']}\">view tweet</a>\n\n"
-                        f"✅ Pipeline working — real new tweets will arrive like this within {INTERVAL_PBSTUK}s.",
+                        f"✅ Pipeline working — real new tweets arrive like this within {INTERVAL_TWITTER}s.",
                         client,
                     )
             else:
@@ -361,8 +380,9 @@ async def telegram_listener(client: httpx.AsyncClient) -> None:
 
 async def main() -> None:
     log.info("=" * 60)
-    log.info("@%s → Telegram bot — starting", PBSTUK_HANDLE)
-    log.info("Poll every %ds  Twitter token: %s", INTERVAL_PBSTUK, "SET" if TWITTER_BEARER_TOKEN else "MISSING")
+    log.info("X → Telegram bot — starting")
+    log.info("Watching: %s", ", ".join(f"@{h}" for h in TWITTER_HANDLES))
+    log.info("Poll every %ds  Twitter token: %s", INTERVAL_TWITTER, "SET" if TWITTER_BEARER_TOKEN else "MISSING")
     log.info("Telegram: %s", "ENABLED" if TELEGRAM_ENABLED else "DISABLED (will log to stdout)")
     log.info("=" * 60)
 
