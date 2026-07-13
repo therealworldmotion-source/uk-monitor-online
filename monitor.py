@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -41,6 +42,21 @@ TWITTER_HANDLES = [
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN", "").strip()
 # INTERVAL_PBSTUK kept for backward-compat with the existing Railway env var.
 INTERVAL_TWITTER = int(os.environ.get("INTERVAL_TWITTER", os.environ.get("INTERVAL_PBSTUK", "30")))
+
+# ─── DISCORD (self-bot) — forward Smyths restock alerts from a group's channel ──
+# Listens as a user account (discord.py-self) to specific channel(s) and forwards any
+# message mentioning a watched store to Telegram. Requires a Discord USER token.
+# NOTE: automating a user account is against Discord ToS — use a burner account.
+DISCORD_USER_TOKEN = os.environ.get("DISCORD_USER_TOKEN", "").strip()
+DISCORD_CHANNEL_IDS = {
+    int(x) for x in os.environ.get("DISCORD_CHANNEL_IDS", "").replace(" ", "").split(",")
+    if x.strip().isdigit()
+}
+DISCORD_STORE_KEYWORDS = [
+    k.strip().lower()
+    for k in os.environ.get("DISCORD_STORE_KEYWORDS", "slough,uxbridge,staines,reading").split(",")
+    if k.strip()
+]
 
 AUTOSTART = os.environ.get("AUTOSTART", "true").lower() == "true"
 
@@ -376,6 +392,95 @@ async def telegram_listener(client: httpx.AsyncClient) -> None:
                 )
 
 
+# ─── DISCORD SELF-BOT LISTENER ────────────────────────────────────────────────
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _discord_message_text(message) -> str:
+    """Flatten a Discord message's content + all embed text (restock bots often post embeds)."""
+    parts = [message.content or ""]
+    for e in getattr(message, "embeds", []) or []:
+        parts += [getattr(e, "title", "") or "", getattr(e, "description", "") or ""]
+        for f in getattr(e, "fields", []) or []:
+            parts += [getattr(f, "name", "") or "", getattr(f, "value", "") or ""]
+        footer = getattr(e, "footer", None)
+        if footer is not None:
+            parts.append(getattr(footer, "text", "") or "")
+        author = getattr(e, "author", None)
+        if author is not None:
+            parts.append(getattr(author, "name", "") or "")
+    return " ".join(p for p in parts if p).strip()
+
+
+async def run_discord_listener(http_client: httpx.AsyncClient) -> None:
+    """Self-bot: watch configured channel(s), forward store-matching messages to Telegram.
+    Reconnects with backoff; alerts Telegram if the token is rejected."""
+    if not DISCORD_USER_TOKEN:
+        log.info("Discord: DISCORD_USER_TOKEN not set — listener disabled")
+        return
+    if not DISCORD_CHANNEL_IDS:
+        log.warning("Discord: DISCORD_CHANNEL_IDS not set — refusing to watch ALL channels; listener disabled")
+        return
+    try:
+        import discord  # discord.py-self
+    except Exception as exc:
+        log.error("Discord: discord.py-self not importable: %s", exc)
+        return
+
+    dclient = discord.Client(chunk_guilds_at_startup=False)
+
+    @dclient.event
+    async def on_ready():
+        log.info("Discord: connected as %s — watching channels %s", dclient.user, DISCORD_CHANNEL_IDS)
+        await send_telegram(
+            f"🎮 <b>Discord listener connected</b>\nForwarding {', '.join(k.title() for k in DISCORD_STORE_KEYWORDS)} alerts.",
+            http_client,
+        )
+
+    @dclient.event
+    async def on_message(message):
+        try:
+            if message.channel.id not in DISCORD_CHANNEL_IDS:
+                return
+            text = _discord_message_text(message)
+            low = text.lower()
+            hit = next((k for k in DISCORD_STORE_KEYWORDS if k in low), None)
+            if not hit:
+                return
+            urls = _URL_RE.findall(text)
+            jump = getattr(message, "jump_url", "")
+            body = text[:1500]
+            extra = ("\n\n" + "\n".join(urls[:3])) if urls else ""
+            link = f"\n\n<a href=\"{jump}\">open in Discord</a>" if jump else ""
+            await send_telegram(
+                f"🎮 <b>SMYTHS {hit.upper()} — Discord alert</b>\n\n{body}{extra}{link}",
+                http_client,
+            )
+            log.info("Discord: forwarded %s alert (msg %s)", hit, message.id)
+        except Exception as exc:
+            log.error("Discord on_message error: %s", exc)
+
+    backoff = 15
+    while True:
+        try:
+            await dclient.start(DISCORD_USER_TOKEN)
+        except Exception as exc:
+            msg = str(exc)
+            log.error("Discord listener error: %s", msg[:200])
+            if "401" in msg or "Improper token" in msg or "LoginFailure" in type(exc).__name__:
+                await send_telegram(
+                    "⚠️ <b>Discord token rejected</b> — the self-bot couldn't log in. "
+                    "Token may be invalid/expired, or Discord flagged the login.",
+                    http_client,
+                )
+                return  # no point hammering a bad token
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+        else:
+            return
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -383,14 +488,18 @@ async def main() -> None:
     log.info("X → Telegram bot — starting")
     log.info("Watching: %s", ", ".join(f"@{h}" for h in TWITTER_HANDLES))
     log.info("Poll every %ds  Twitter token: %s", INTERVAL_TWITTER, "SET" if TWITTER_BEARER_TOKEN else "MISSING")
+    log.info("Discord listener: %s", "ENABLED" if (DISCORD_USER_TOKEN and DISCORD_CHANNEL_IDS) else "disabled")
     log.info("Telegram: %s", "ENABLED" if TELEGRAM_ENABLED else "DISABLED (will log to stdout)")
     log.info("=" * 60)
 
     async with httpx.AsyncClient(timeout=35, follow_redirects=True) as client:
+        discord_task = asyncio.create_task(run_discord_listener(client))
         try:
             await telegram_listener(client)
         except (KeyboardInterrupt, asyncio.CancelledError):
             log.info("Shutting down")
+        finally:
+            discord_task.cancel()
 
 
 if __name__ == "__main__":
