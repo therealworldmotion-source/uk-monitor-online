@@ -432,9 +432,18 @@ async def run_discord_listener(http_client: httpx.AsyncClient) -> None:
 
     @dclient.event
     async def on_ready():
-        log.info("Discord: connected as %s — watching channels %s", dclient.user, DISCORD_CHANNEL_IDS)
+        # Report whether the account can actually SEE each watched channel — if not,
+        # no alerts will ever fire (account not in the server / no channel permission).
+        seen = []
+        for cid in DISCORD_CHANNEL_IDS:
+            ch = dclient.get_channel(cid)
+            seen.append(f"{getattr(ch, 'name', None) or 'NOT VISIBLE'} ({cid})")
+        all_visible = all("NOT VISIBLE" not in s for s in seen)
+        log.info("Discord: connected as %s — channels: %s", dclient.user, seen)
         await send_telegram(
-            f"🎮 <b>Discord listener connected</b>\nForwarding {', '.join(k.title() for k in DISCORD_STORE_KEYWORDS)} alerts.",
+            f"🎮 <b>Discord listener connected</b> as {dclient.user}\n"
+            f"Channel access: {'✅ ' + ', '.join(seen) if all_visible else '❌ CANNOT SEE: ' + ', '.join(seen)}\n"
+            f"Forwarding {', '.join(k.title() for k in DISCORD_STORE_KEYWORDS)} alerts.",
             http_client,
         )
 
