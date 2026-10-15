@@ -13,6 +13,7 @@ Designed for a single Railway container. State persists to DATA_DIR
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -57,6 +58,13 @@ DISCORD_STORE_KEYWORDS = [
     for k in os.environ.get("DISCORD_STORE_KEYWORDS", "slough,uxbridge,staines,reading").split(",")
     if k.strip()
 ]
+# Channels where EVERY message is forwarded, no keyword filter (e.g. the PBST
+# Pokemon Center queue alerts channel, which only ever posts bot alerts).
+DISCORD_ALERT_CHANNEL_IDS = {
+    int(x) for x in os.environ.get("DISCORD_ALERT_CHANNEL_IDS", "").replace(" ", "").split(",")
+    if x.strip().isdigit()
+}
+DISCORD_ALL_CHANNEL_IDS = DISCORD_CHANNEL_IDS | DISCORD_ALERT_CHANNEL_IDS
 
 AUTOSTART = os.environ.get("AUTOSTART", "true").lower() == "true"
 
@@ -394,12 +402,14 @@ async def telegram_listener(client: httpx.AsyncClient) -> None:
 
 # ─── DISCORD SELF-BOT LISTENER ────────────────────────────────────────────────
 
-_URL_RE = re.compile(r"https?://\S+")
+_URL_RE = re.compile(r"https?://[^\s,]+")
+_MENTION_RE = re.compile(r"<(?:@[!&]?|#)\d+>")
 
 
 def _discord_message_text(message) -> str:
-    """Flatten a Discord message's content + all embed text (restock bots often post embeds)."""
-    parts = [message.content or ""]
+    """Flatten a Discord message's content + all embed text (restock bots often post embeds).
+    Raw role/user/channel mentions (<@&123>) are dropped — they're noise in Telegram."""
+    parts = [_MENTION_RE.sub("", message.content or "")]
     for e in getattr(message, "embeds", []) or []:
         parts += [getattr(e, "title", "") or "", getattr(e, "description", "") or ""]
         for f in getattr(e, "fields", []) or []:
@@ -419,8 +429,8 @@ async def run_discord_listener(http_client: httpx.AsyncClient) -> None:
     if not DISCORD_USER_TOKEN:
         log.info("Discord: DISCORD_USER_TOKEN not set — listener disabled")
         return
-    if not DISCORD_CHANNEL_IDS:
-        log.warning("Discord: DISCORD_CHANNEL_IDS not set — refusing to watch ALL channels; listener disabled")
+    if not DISCORD_ALL_CHANNEL_IDS:
+        log.warning("Discord: no channel IDs set — refusing to watch ALL channels; listener disabled")
         return
     try:
         import discord  # discord.py-self
@@ -435,37 +445,45 @@ async def run_discord_listener(http_client: httpx.AsyncClient) -> None:
         # Report whether the account can actually SEE each watched channel — if not,
         # no alerts will ever fire (account not in the server / no channel permission).
         seen = []
-        for cid in DISCORD_CHANNEL_IDS:
+        for cid in sorted(DISCORD_ALL_CHANNEL_IDS):
             ch = dclient.get_channel(cid)
             seen.append(f"{getattr(ch, 'name', None) or 'NOT VISIBLE'} ({cid})")
         all_visible = all("NOT VISIBLE" not in s for s in seen)
         log.info("Discord: connected as %s — channels: %s", dclient.user, seen)
-        await send_telegram(
-            f"🎮 <b>Discord listener connected</b> as {dclient.user}\n"
-            f"Channel access: {'✅ ' + ', '.join(seen) if all_visible else '❌ CANNOT SEE: ' + ', '.join(seen)}\n"
-            f"Forwarding {', '.join(k.title() for k in DISCORD_STORE_KEYWORDS)} alerts.",
-            http_client,
-        )
+        lines = [
+            f"🎮 <b>Discord listener connected</b> as {html.escape(str(dclient.user))}",
+            f"Channel access: {'✅ ' if all_visible else '❌ CANNOT SEE: '}{html.escape(', '.join(seen))}",
+        ]
+        if DISCORD_CHANNEL_IDS:
+            lines.append(f"Smyths: forwarding {', '.join(k.title() for k in DISCORD_STORE_KEYWORDS)} alerts.")
+        if DISCORD_ALERT_CHANNEL_IDS:
+            lines.append("Pokémon Center queue: forwarding every alert.")
+        await send_telegram("\n".join(lines), http_client)
+
+    async def _forward(message, header: str, text: str) -> None:
+        urls = list(dict.fromkeys(_URL_RE.findall(text)))  # dedupe, keep order
+        jump = getattr(message, "jump_url", "")
+        body = html.escape(text[:1500])
+        extra = ("\n\n" + "\n".join(html.escape(u) for u in urls[:3])) if urls else ""
+        link = f"\n\n<a href=\"{html.escape(jump)}\">open in Discord</a>" if jump else ""
+        await send_telegram(f"{header}\n\n{body}{extra}{link}", http_client)
 
     @dclient.event
     async def on_message(message):
         try:
-            if message.channel.id not in DISCORD_CHANNEL_IDS:
+            cid = message.channel.id
+            if cid not in DISCORD_ALL_CHANNEL_IDS:
                 return
             text = _discord_message_text(message)
+            if cid in DISCORD_ALERT_CHANNEL_IDS:
+                await _forward(message, "🚨 <b>POKÉMON CENTER QUEUE — Discord alert</b>", text)
+                log.info("Discord: forwarded Pokemon Center alert (msg %s)", message.id)
+                return
             low = text.lower()
             hit = next((k for k in DISCORD_STORE_KEYWORDS if k in low), None)
             if not hit:
                 return
-            urls = _URL_RE.findall(text)
-            jump = getattr(message, "jump_url", "")
-            body = text[:1500]
-            extra = ("\n\n" + "\n".join(urls[:3])) if urls else ""
-            link = f"\n\n<a href=\"{jump}\">open in Discord</a>" if jump else ""
-            await send_telegram(
-                f"🎮 <b>SMYTHS {hit.upper()} — Discord alert</b>\n\n{body}{extra}{link}",
-                http_client,
-            )
+            await _forward(message, f"🎮 <b>SMYTHS {hit.upper()} — Discord alert</b>", text)
             log.info("Discord: forwarded %s alert (msg %s)", hit, message.id)
         except Exception as exc:
             log.error("Discord on_message error: %s", exc)
@@ -497,7 +515,7 @@ async def main() -> None:
     log.info("X → Telegram bot — starting")
     log.info("Watching: %s", ", ".join(f"@{h}" for h in TWITTER_HANDLES))
     log.info("Poll every %ds  Twitter token: %s", INTERVAL_TWITTER, "SET" if TWITTER_BEARER_TOKEN else "MISSING")
-    log.info("Discord listener: %s", "ENABLED" if (DISCORD_USER_TOKEN and DISCORD_CHANNEL_IDS) else "disabled")
+    log.info("Discord listener: %s", "ENABLED" if (DISCORD_USER_TOKEN and DISCORD_ALL_CHANNEL_IDS) else "disabled")
     log.info("Telegram: %s", "ENABLED" if TELEGRAM_ENABLED else "DISABLED (will log to stdout)")
     log.info("=" * 60)
 
