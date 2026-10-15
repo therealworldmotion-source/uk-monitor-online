@@ -65,6 +65,9 @@ DISCORD_ALERT_CHANNEL_IDS = {
     if x.strip().isdigit()
 }
 DISCORD_ALL_CHANNEL_IDS = DISCORD_CHANNEL_IDS | DISCORD_ALERT_CHANNEL_IDS
+# How many Telegram notifications each alert-channel message fires (1 full alert +
+# N-1 short follow-up pings a few seconds apart, so the phone buzzes more than once).
+DISCORD_ALERT_REPEAT = max(1, int(os.environ.get("DISCORD_ALERT_REPEAT", "2")))
 
 AUTOSTART = os.environ.get("AUTOSTART", "true").lower() == "true"
 
@@ -477,7 +480,14 @@ async def run_discord_listener(http_client: httpx.AsyncClient) -> None:
             text = _discord_message_text(message)
             if cid in DISCORD_ALERT_CHANNEL_IDS:
                 await _forward(message, "🚨 <b>POKÉMON CENTER QUEUE — Discord alert</b>", text)
-                log.info("Discord: forwarded Pokemon Center alert (msg %s)", message.id)
+                for _ in range(DISCORD_ALERT_REPEAT - 1):
+                    await asyncio.sleep(3)
+                    await send_telegram(
+                        "🚨🚨 <b>POKÉMON CENTER QUEUE IS UP — GO</b>\n"
+                        "<a href=\"https://www.pokemoncenter.com/en-gb\">pokemoncenter.com/en-gb</a>",
+                        http_client,
+                    )
+                log.info("Discord: forwarded Pokemon Center alert x%d (msg %s)", DISCORD_ALERT_REPEAT, message.id)
                 return
             low = text.lower()
             hit = next((k for k in DISCORD_STORE_KEYWORDS if k in low), None)
